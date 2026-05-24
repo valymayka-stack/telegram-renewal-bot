@@ -4,12 +4,14 @@ Production-ready Telegram renewal bot built with Python 3.11, aiogram 3, Supabas
 
 ## Features
 
-- Admin-only `/send_poll` command that sends a non-anonymous poll to `CONTENT_CHANNEL_ID`.
-- Captures `poll_answer` updates and stores or updates users in Supabase.
+- Admin-only `/send_poll` command that sends a CTA message with one inline button to `CONTENT_CHANNEL_ID`.
+- Captures CTA button clicks and stores or updates users in Supabase.
 - Admin-only `/users` command with total registered users and latest 10 users.
 - Admin-only `/set_expiry <telegram_id> <YYYY-MM-DD>` command.
 - Admin-only `/expired` command that lists expired users without removing anyone.
+- Admin-only `/sync_schema` command that safely adds missing dashboard lifecycle columns when a Supabase `exec_sql` RPC is available.
 - Daily scheduled notification to `ADMIN_CHAT_ID` for users expiring today.
+- Secure FastAPI admin dashboard with password login, filters, renewal actions, one-use invite links, and channel removal.
 - Structured logging and defensive error handling.
 
 ## Supabase schema
@@ -22,10 +24,14 @@ create table if not exists telegram_users (
   username text,
   first_name text,
   last_name text,
-  last_poll_id text,
-  selected_option text,
+  status text,
+  notes text,
   registered_at timestamptz not null default now(),
-  expiry_date date
+  joined_at timestamptz,
+  expiry_date date,
+  last_payment_at timestamptz,
+  invite_link text,
+  removed_at timestamptz
 );
 
 create index if not exists telegram_users_registered_at_idx
@@ -35,15 +41,36 @@ create index if not exists telegram_users_expiry_date_idx
   on telegram_users (expiry_date);
 ```
 
+For existing tables, `/sync_schema` and startup migration attempt to run:
+
+```sql
+alter table public.telegram_users add column if not exists joined_at timestamptz;
+alter table public.telegram_users add column if not exists last_payment_at timestamptz;
+alter table public.telegram_users add column if not exists invite_link text;
+alter table public.telegram_users add column if not exists removed_at timestamptz;
+alter table public.telegram_users add column if not exists status text;
+alter table public.telegram_users add column if not exists notes text;
+alter table public.telegram_users add column if not exists expiry_date date;
+update public.telegram_users
+set joined_at = coalesce(joined_at, registered_at, now())
+where joined_at is null;
+update public.telegram_users
+set expiry_date = (joined_at + interval '30 days')::date
+where expiry_date is null and joined_at is not null;
+```
+
+Supabase REST does not expose DDL by default. To let the bot run this automatically, create a tightly controlled `exec_sql` RPC for your server-side service role, or run the SQL manually in the Supabase SQL editor.
+
 Use the Supabase service role key only on Railway/server-side infrastructure. Never expose it in client code.
 
 ## Telegram setup
 
 1. Create a bot with BotFather and copy the token.
 2. Add the bot to your content channel.
-3. Promote the bot to admin in the channel so it can send polls.
-4. Disable privacy mode if you later need group command behavior. Channel poll answers are delivered to the bot when the bot created the poll.
-5. Get your numeric Telegram admin user ID and add it to `ADMIN_USER_IDS`.
+3. Promote the bot to admin in the channel so it can send messages.
+4. Give the bot permission to invite users and ban users if you want dashboard invite/removal actions.
+5. Disable privacy mode if you later need group command behavior.
+6. Get your numeric Telegram admin user ID and add it to `ADMIN_USER_IDS`.
 
 ## Environment variables
 
@@ -56,6 +83,7 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 ADMIN_CHAT_ID=123456789
 CONTENT_CHANNEL_ID=-1001234567890
 ADMIN_USER_IDS=123456789,987654321
+ADMIN_PASSWORD=use-a-long-random-password
 ```
 
 `CONTENT_CHANNEL_ID` can be a numeric channel ID or a public `@channelusername`.
@@ -71,6 +99,8 @@ python main.py
 
 Optional local `.env` files are supported through `python-dotenv`.
 
+The local web dashboard runs on `http://localhost:8000` unless `PORT` is set.
+
 ## Commands
 
 ```text
@@ -78,9 +108,44 @@ Optional local `.env` files are supported through `python-dotenv`.
 /users
 /set_expiry <telegram_id> <YYYY-MM-DD>
 /expired
+/sync_schema
 ```
 
 Only users listed in `ADMIN_USER_IDS` can run admin commands.
+
+## Web dashboard
+
+Open `/login` and sign in with `ADMIN_PASSWORD`. The dashboard is available at `/dashboard`.
+
+Dashboard columns:
+
+- `telegram_id`
+- `username`
+- `first_name`
+- `status`
+- `joined_at`
+- `expiry_date`
+- days remaining
+- `notes`
+
+Dashboard filters:
+
+- All
+- Active
+- Expiring in 7 days
+- Expired
+- No expiry date
+
+Dashboard actions:
+
+- Renew +30 days from today
+- Renew +30 days from current expiry date if still active
+- Mark paid
+- Mark inactive
+- Generate one-use invite link using Telegram Bot API for `CONTENT_CHANNEL_ID`
+- Remove from channel using a confirmation page, then Telegram ban/unban
+
+The dashboard stores signed session cookies and does not expose the Supabase service role key to the browser.
 
 ## Daily expiry notification
 
@@ -91,10 +156,10 @@ The bot runs an in-process scheduler while long polling is active. It sends a da
 1. Push this repository to GitHub.
 2. Create a new Railway project from the repo.
 3. Add all required environment variables.
-4. Railway will use `Procfile` / `railway.json` to run:
+4. Railway will use `railway.json` to run:
 
 ```bash
 python main.py
 ```
 
-Run this service as a worker. Do not configure a webhook for the bot.
+Run this service as a web service. The FastAPI dashboard and Telegram long-polling bot run in the same process. Do not configure a webhook for the bot.

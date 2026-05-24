@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Renewal Dashboard</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f5f7fb;
+        color: #162033;
+      }
+      body {
+        margin: 0;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 20px 28px;
+        background: #ffffff;
+        border-bottom: 1px solid #dfe5ef;
+      }
+      h1 {
+        margin: 0;
+        font-size: 24px;
+      }
+      main {
+        padding: 22px 28px 40px;
+      }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+      .filters {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      a,
+      button {
+        font: inherit;
+      }
+      .filter {
+        display: inline-flex;
+        align-items: center;
+        min-height: 34px;
+        padding: 0 12px;
+        border-radius: 6px;
+        border: 1px solid #becada;
+        color: #1f2b3d;
+        background: #ffffff;
+        text-decoration: none;
+        font-size: 14px;
+      }
+      .filter.active {
+        border-color: #176b54;
+        background: #e8f5f0;
+        color: #0f513f;
+        font-weight: 700;
+      }
+      .notice,
+      .error,
+      .invite {
+        margin: 0 0 14px;
+        border-radius: 6px;
+        padding: 10px 12px;
+        font-size: 14px;
+      }
+      .notice {
+        border: 1px solid #abd8c5;
+        background: #ecfbf4;
+        color: #11553f;
+      }
+      .error {
+        border: 1px solid #f3b5ae;
+        background: #fff1ef;
+        color: #9f2d20;
+      }
+      .invite {
+        border: 1px solid #b8c9f3;
+        background: #eef4ff;
+        color: #1d3f87;
+        overflow-wrap: anywhere;
+      }
+      .table-wrap {
+        overflow-x: auto;
+        background: #ffffff;
+        border: 1px solid #dfe5ef;
+        border-radius: 8px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 1260px;
+      }
+      th,
+      td {
+        padding: 12px 14px;
+        border-bottom: 1px solid #e6ebf2;
+        text-align: left;
+        vertical-align: top;
+        font-size: 14px;
+      }
+      th {
+        background: #f9fbfe;
+        color: #526074;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      tr:last-child td {
+        border-bottom: 0;
+      }
+      .actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(140px, 1fr));
+        gap: 8px;
+      }
+      .actions form {
+        margin: 0;
+      }
+      .action {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        box-sizing: border-box;
+        text-decoration: none;
+        width: 100%;
+        min-height: 34px;
+        border-radius: 6px;
+        border: 1px solid #becada;
+        background: #ffffff;
+        color: #1f2b3d;
+        cursor: pointer;
+        padding: 6px 10px;
+        font-size: 13px;
+      }
+      .action.primary {
+        border-color: #176b54;
+        color: #0f513f;
+      }
+      .action.danger {
+        border-color: #de9b93;
+        color: #9f2d20;
+      }
+      .logout {
+        border: 1px solid #becada;
+        border-radius: 6px;
+        background: #ffffff;
+        color: #1f2b3d;
+        cursor: pointer;
+        padding: 8px 12px;
+      }
+      .empty {
+        padding: 24px;
+        color: #526074;
+      }
+      @media (max-width: 760px) {
+        header,
+        main {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+        .toolbar {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Renewal Dashboard</h1>
+      <form method="post" action="/logout">
+        <button class="logout" type="submit">Sign out</button>
+      </form>
+    </header>
+    <main>
+      <div class="toolbar">
+        <nav class="filters" aria-label="User filters">
+          <a class="filter {% if active_filter == 'all' %}active{% endif %}" href="/dashboard?filter=all">All</a>
+          <a class="filter {% if active_filter == 'active' %}active{% endif %}" href="/dashboard?filter=active">Active</a>
+          <a class="filter {% if active_filter == 'expiring_7' %}active{% endif %}" href="/dashboard?filter=expiring_7">Expiring in 7 days</a>
+          <a class="filter {% if active_filter == 'expired' %}active{% endif %}" href="/dashboard?filter=expired">Expired</a>
+          <a class="filter {% if active_filter == 'no_expiry' %}active{% endif %}" href="/dashboard?filter=no_expiry">No expiry date</a>
+        </nav>
+        <div>{{ users|length }} users</div>
+      </div>
+
+      {% if message %}
+        <p class="notice">{{ message }}</p>
+      {% endif %}
+      {% if error %}
+        <p class="error">{{ error }}</p>
+      {% endif %}
+      {% if invite_link %}
+        <p class="invite">{{ invite_link }}</p>
+      {% endif %}
+
+      <div class="table-wrap">
+        {% if users %}
+          <table>
+            <thead>
+              <tr>
+                <th>Telegram ID</th>
+                <th>Username</th>
+                <th>First Name</th>
+                <th>Status</th>
+                <th>Joined At</th>
+                <th>Expiry Date</th>
+                <th>Days Remaining</th>
+                <th>Notes</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for user in users %}
+                <tr>
+                  <td>{{ user.telegram_id }}</td>
+                  <td>{% if user.username %}@{{ user.username }}{% else %}-{% endif %}</td>
+                  <td>{{ user.first_name or "-" }}</td>
+                  <td>{{ user.status or "-" }}</td>
+                  <td>{{ user.joined_at or "-" }}</td>
+                  <td>{{ user.expiry_date or "-" }}</td>
+                  <td>{% if user.days_remaining is not none %}{{ user.days_remaining }}{% else %}-{% endif %}</td>
+                  <td>{{ user.notes or "-" }}</td>
+                  <td>
+                    <div class="actions">
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/renew/today?filter={{ active_filter }}">
+                        <button class="action primary" type="submit">Renew +30 from today</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/renew/current-expiry?filter={{ active_filter }}">
+                        <button class="action primary" type="submit">Renew +30 from expiry</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/paid?filter={{ active_filter }}">
+                        <button class="action" type="submit">Mark paid</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/inactive?filter={{ active_filter }}" onsubmit="return confirm('Mark this user inactive?');">
+                        <button class="action" type="submit">Mark inactive</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/invite?filter={{ active_filter }}">
+                        <button class="action" type="submit">Generate invite link</button>
+                      </form>
+                      <a class="action danger" href="/dashboard/users/{{ user.telegram_id }}/remove?filter={{ active_filter }}">Remove from channel</a>
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No users found for this filter.</div>
+        {% endif %}
+      </div>
+    </main>
+  </body>
+</html>
