@@ -575,8 +575,8 @@ def dashboard_redirect(
 
 
 def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
-    templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-    app = FastAPI(title="Telegram Renewal Admin")
+    templates = Jinja2Templates(directory="templates")
+    app = FastAPI()
     app.add_middleware(
         SessionMiddleware,
         secret_key=f"{settings.bot_token}:{settings.admin_password}",
@@ -777,7 +777,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
 async def run_web_server(app: FastAPI) -> None:
     PORT = int(os.getenv("PORT", "8080"))
     logger.info(f"Starting web dashboard on port {PORT}")
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT)
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
