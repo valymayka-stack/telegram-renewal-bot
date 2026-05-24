@@ -189,7 +189,7 @@ async def users(message: Message, settings: Settings, supabase: Client) -> None:
     try:
         count_response = (
             supabase.table("telegram_users")
-            .select("telegram_id", count="exact")
+            .select("*", count="exact")
             .execute()
         )
         latest_response = (
