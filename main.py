@@ -6,18 +6,20 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
-from aiogram.types import ErrorEvent, Message, PollAnswer
+from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
 
-POLL_QUESTION = "¿Qué contenido te gustaría ver más este mes?"
-POLL_OPTIONS = ["Fotos", "Videos", "Lives", "Todo"]
+CTA_MESSAGE = "¿Quieres ver más contenido como este? 🔥"
+CTA_BUTTON_TEXT = "QUIERO MÁS CONTENIDO 🔥"
+CTA_CALLBACK_DATA = "want_more_content"
+CTA_NOTES = "Clicked QUIERO MÁS CONTENIDO button"
 DATE_FORMAT = "%Y-%m-%d"
 APP_TIMEZONE = ZoneInfo("America/Mexico_City")
 
@@ -109,11 +111,11 @@ def format_user(row: dict[str, Any]) -> str:
     username = row.get("username")
     first_name = row.get("first_name") or ""
     last_name = row.get("last_name") or ""
-    selected = row.get("selected_option") or "-"
+    status = row.get("status") or "-"
     expiry = row.get("expiry_date") or "-"
     handle = f"@{username}" if username else "(sin username)"
     full_name = " ".join(part for part in [first_name, last_name] if part).strip() or "(sin nombre)"
-    return f"{telegram_id} | {handle} | {full_name} | poll: {selected} | vence: {expiry}"
+    return f"{telegram_id} | {handle} | {full_name} | status: {status} | vence: {expiry}"
 
 
 def get_registered_user(supabase: Client, telegram_id: int) -> dict[str, Any] | None:
@@ -127,35 +129,47 @@ def get_registered_user(supabase: Client, telegram_id: int) -> dict[str, Any] | 
     return response.data[0] if response.data else None
 
 
-def upsert_poll_user(supabase: Client, poll_answer: PollAnswer) -> None:
-    selected_option = None
-    if poll_answer.option_ids:
-        option_id = poll_answer.option_ids[0]
-        selected_option = POLL_OPTIONS[option_id] if 0 <= option_id < len(POLL_OPTIONS) else str(option_id)
+def build_cta_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=CTA_BUTTON_TEXT,
+                    callback_data=CTA_CALLBACK_DATA,
+                )
+            ]
+        ]
+    )
 
-    existing = get_registered_user(supabase, poll_answer.user.id)
+
+def upsert_cta_user(supabase: Client, callback_query: CallbackQuery) -> None:
+    if not callback_query.from_user:
+        raise ValueError("Callback query has no from_user")
+
+    user = callback_query.from_user
+    existing = get_registered_user(supabase, user.id)
     payload = {
-        "telegram_id": poll_answer.user.id,
-        "username": poll_answer.user.username,
-        "first_name": poll_answer.user.first_name,
-        "last_name": poll_answer.user.last_name,
-        "last_poll_id": poll_answer.poll_id,
-        "selected_option": selected_option,
+        "telegram_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "status": "active",
+        "notes": CTA_NOTES,
     }
 
     if existing:
         (
             supabase.table("telegram_users")
             .update(payload)
-            .eq("telegram_id", poll_answer.user.id)
+            .eq("telegram_id", user.id)
             .execute()
         )
-        logger.info("Updated poll answer for telegram_id=%s", poll_answer.user.id)
+        logger.info("Updated CTA user telegram_id=%s", user.id)
         return
 
     payload["registered_at"] = datetime.now(timezone.utc).isoformat()
     supabase.table("telegram_users").insert(payload).execute()
-    logger.info("Registered poll user telegram_id=%s", poll_answer.user.id)
+    logger.info("Registered CTA user telegram_id=%s", user.id)
 
 
 @router.message(Command("send_poll"))
@@ -165,19 +179,17 @@ async def send_poll(message: Message, settings: Settings) -> None:
         return
 
     try:
-        await message.bot.send_poll(
+        await message.bot.send_message(
             chat_id=settings.content_channel_id,
-            question=POLL_QUESTION,
-            options=POLL_OPTIONS,
-            is_anonymous=True,
-            allows_multiple_answers=False,
+            text=CTA_MESSAGE,
+            reply_markup=build_cta_keyboard(),
         )
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
-        logger.exception("Could not send poll")
-        await message.answer(f"No pude enviar la encuesta: {exc}")
+        logger.exception("Could not send CTA message")
+        await message.answer(f"No pude enviar el mensaje: {exc}")
         return
 
-    await message.answer("Encuesta enviada al canal.")
+    await message.answer("Mensaje enviado al canal.")
 
 
 @router.message(Command("users"))
@@ -278,12 +290,15 @@ async def expired(message: Message, settings: Settings, supabase: Client) -> Non
     await send_long_message(message, "\n".join(lines))
 
 
-@router.poll_answer()
-async def poll_answer(poll_answer_update: PollAnswer, supabase: Client) -> None:
+@router.callback_query(F.data == CTA_CALLBACK_DATA)
+async def want_more_content(callback_query: CallbackQuery, supabase: Client) -> None:
     try:
-        upsert_poll_user(supabase, poll_answer_update)
+        upsert_cta_user(supabase, callback_query)
+        await callback_query.answer("Listo 🔥")
     except Exception:
-        logger.exception("Could not process poll answer for user_id=%s", poll_answer_update.user.id)
+        user_id = callback_query.from_user.id if callback_query.from_user else "unknown"
+        logger.exception("Could not process CTA callback for user_id=%s", user_id)
+        await callback_query.answer("Intenta de nuevo.", show_alert=False)
 
 
 @router.error()
