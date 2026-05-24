@@ -545,7 +545,7 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
     )
     scheduler.start()
 
-    logger.info("Bot polling started")
+    logger.info("Starting Telegram bot polling")
     try:
         await dp.start_polling(
             bot,
@@ -775,34 +775,38 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
 
 
 async def run_web_server(app: FastAPI) -> None:
-    PORT = int(os.getenv("PORT", "8000"))
+    PORT = int(os.getenv("PORT", "8080"))
     logger.info("Starting web dashboard on port %s", PORT)
     config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info", proxy_headers=True)
     server = uvicorn.Server(config)
     await server.serve()
 
 
-async def main() -> None:
-    configure_logging()
-    settings = load_settings()
-    supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
+async def run_startup_migration(supabase: Client) -> None:
     try:
         await asyncio.to_thread(run_schema_migration, supabase)
         logger.info("Schema migration completed")
     except Exception:
         logger.warning("Schema migration skipped or failed; use /sync_schema or run README SQL", exc_info=True)
+
+
+async def main() -> None:
+    configure_logging()
+    settings = load_settings()
+    supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
     bot = Bot(settings.bot_token)
     web_app = create_web_app(settings, supabase, bot)
 
+    migration_task = asyncio.create_task(run_startup_migration(supabase), name="schema-migration")
     bot_task = asyncio.create_task(run_telegram_bot(bot, supabase, settings), name="telegram-bot")
     web_task = asyncio.create_task(run_web_server(web_app), name="web-server")
     try:
-        await asyncio.gather(bot_task, web_task)
+        await asyncio.gather(bot_task, web_task, migration_task)
     finally:
-        for task in (bot_task, web_task):
+        for task in (bot_task, web_task, migration_task):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(bot_task, web_task, return_exceptions=True)
+        await asyncio.gather(bot_task, web_task, migration_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
