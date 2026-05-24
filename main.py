@@ -545,7 +545,7 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
     )
     scheduler.start()
 
-    logger.info("Bot started with long polling")
+    logger.info("Bot polling started")
     try:
         await dp.start_polling(
             bot,
@@ -775,8 +775,9 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
 
 
 async def run_web_server(app: FastAPI) -> None:
-    port = int(os.getenv("PORT", "8000"))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", proxy_headers=True)
+    PORT = int(os.getenv("PORT", "8000"))
+    logger.info("Starting web dashboard on port %s", PORT)
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info", proxy_headers=True)
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -795,20 +796,13 @@ async def main() -> None:
 
     bot_task = asyncio.create_task(run_telegram_bot(bot, supabase, settings), name="telegram-bot")
     web_task = asyncio.create_task(run_web_server(web_app), name="web-server")
-    done, pending = await asyncio.wait({bot_task, web_task}, return_when=asyncio.FIRST_COMPLETED)
-
-    for task in done:
-        exc = task.exception()
-        if exc:
-            logger.error(
-                "%s stopped unexpectedly",
-                task.get_name(),
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
-
-    for task in pending:
-        task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        await asyncio.gather(bot_task, web_task)
+    finally:
+        for task in (bot_task, web_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(bot_task, web_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
