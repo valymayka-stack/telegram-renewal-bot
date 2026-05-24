@@ -776,8 +776,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
 
 async def run_web_server(app: FastAPI) -> None:
     PORT = int(os.getenv("PORT", "8080"))
-    logger.info("Starting web dashboard on port %s", PORT)
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info", proxy_headers=True)
+    logger.info(f"Starting web dashboard on port {PORT}")
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT)
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -795,18 +795,18 @@ async def main() -> None:
     settings = load_settings()
     supabase = create_client(settings.supabase_url, settings.supabase_service_role_key)
     bot = Bot(settings.bot_token)
-    web_app = create_web_app(settings, supabase, bot)
+    app = create_web_app(settings, supabase, bot)
 
-    migration_task = asyncio.create_task(run_startup_migration(supabase), name="schema-migration")
+    asyncio.create_task(run_startup_migration(supabase), name="schema-migration")
     bot_task = asyncio.create_task(run_telegram_bot(bot, supabase, settings), name="telegram-bot")
-    web_task = asyncio.create_task(run_web_server(web_app), name="web-server")
+    web_task = asyncio.create_task(run_web_server(app), name="web-server")
     try:
-        await asyncio.gather(bot_task, web_task, migration_task)
+        await asyncio.gather(bot_task, web_task)
     finally:
-        for task in (bot_task, web_task, migration_task):
+        for task in (bot_task, web_task):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(bot_task, web_task, migration_task, return_exceptions=True)
+        await asyncio.gather(bot_task, web_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
