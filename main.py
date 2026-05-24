@@ -169,7 +169,7 @@ async def send_poll(message: Message, settings: Settings) -> None:
             chat_id=settings.content_channel_id,
             question=POLL_QUESTION,
             options=POLL_OPTIONS,
-            is_anonymous=False,
+            is_anonymous=True,
             allows_multiple_answers=False,
         )
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
