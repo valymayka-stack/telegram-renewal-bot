@@ -182,6 +182,74 @@
         padding: 4px 8px;
         font-size: 12px;
       }
+      .copy-link {
+        margin-top: 8px;
+        width: auto;
+        min-height: 28px;
+        padding: 4px 8px;
+        font-size: 12px;
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 24px;
+        border-radius: 999px;
+        padding: 2px 9px;
+        font-size: 12px;
+        font-weight: 700;
+        border: 1px solid transparent;
+        white-space: nowrap;
+      }
+      .badge-green {
+        color: #0f513f;
+        background: #e8f5f0;
+        border-color: #abd8c5;
+      }
+      .badge-yellow {
+        color: #684a00;
+        background: #fff7d6;
+        border-color: #f1d37a;
+      }
+      .badge-orange {
+        color: #8a3b00;
+        background: #fff1df;
+        border-color: #efbf88;
+      }
+      .badge-red {
+        color: #9f2d20;
+        background: #fff1ef;
+        border-color: #f3b5ae;
+      }
+      .badge-gray {
+        color: #526074;
+        background: #f0f3f7;
+        border-color: #d4dbe6;
+      }
+      .history {
+        margin-top: 12px;
+        border-top: 1px solid #e6ebf2;
+        padding-top: 10px;
+      }
+      .history summary {
+        cursor: pointer;
+        color: #1d3f87;
+        font-weight: 700;
+      }
+      .history-list {
+        display: grid;
+        gap: 8px;
+        margin: 10px 0;
+      }
+      .history-item {
+        border: 1px solid #e6ebf2;
+        border-radius: 6px;
+        padding: 8px;
+        background: #f9fbfe;
+      }
+      .history-meta {
+        color: #526074;
+        font-size: 12px;
+      }
       .date-action {
         display: grid;
         gap: 6px;
@@ -249,6 +317,7 @@
             <a class="filter {% if active_filter == 'expiring_7' %}active{% endif %}" href="/dashboard?filter=expiring_7&search={{ search }}">Expiring in 7 days</a>
             <a class="filter {% if active_filter == 'expired' %}active{% endif %}" href="/dashboard?filter=expired&search={{ search }}">Expired</a>
             <a class="filter {% if active_filter == 'no_expiry' %}active{% endif %}" href="/dashboard?filter=no_expiry&search={{ search }}">No expiry date</a>
+            <a class="filter {% if active_filter == 'has_payment_history' %}active{% endif %}" href="/dashboard?filter=has_payment_history&search={{ search }}">Has payment history</a>
             <a class="filter {% if active_filter == 'removed_inactive' %}active{% endif %}" href="/dashboard?filter=removed_inactive&search={{ search }}">Removed/inactive</a>
           </nav>
           <form class="search" method="get" action="/dashboard">
@@ -300,12 +369,22 @@
                 <tr>
                   <td>
                     <div>{{ user.telegram_id }}</div>
-                    <button class="action copy-id" type="button" data-copy="{{ user.telegram_id }}">Copy ID</button>
+                    <button class="action copy-id" type="button" data-copy="{{ user.telegram_id }}" data-copy-label="Copy Telegram ID">Copy Telegram ID</button>
                   </td>
                   <td>{% if user.username %}@{{ user.username }}{% else %}-{% endif %}</td>
                   <td>{{ user.first_name or "-" }}</td>
-                  <td>{{ user.payment_status or "-" }}</td>
-                  <td>{{ user.status or "-" }}</td>
+                  <td>
+                    {% set payment_status = user.payment_status or "unpaid" %}
+                    <span class="badge {% if payment_status == 'paid' %}badge-green{% elif payment_status == 'pending_review' %}badge-yellow{% elif payment_status == 'needs_new_receipt' %}badge-orange{% elif payment_status == 'rejected' %}badge-red{% else %}badge-gray{% endif %}">
+                      {{ payment_status }}
+                    </span>
+                  </td>
+                  <td>
+                    {% set row_status = user.status or "-" %}
+                    <span class="badge {% if user.days_remaining is not none and user.days_remaining < 0 %}badge-red{% elif row_status == 'active' %}badge-green{% elif row_status == 'inactive' %}badge-gray{% else %}badge-gray{% endif %}">
+                      {% if user.days_remaining is not none and user.days_remaining < 0 %}expired{% else %}{{ row_status }}{% endif %}
+                    </span>
+                  </td>
                   <td>{% if user.confirmed_subscription %}Yes{% else %}No{% endif %}</td>
                   <td>{{ user.confirmed_at_display or "-" }}</td>
                   <td>{{ user.source or "-" }}</td>
@@ -315,7 +394,14 @@
                   <td>{% if user.days_remaining is not none %}{{ user.days_remaining }}{% else %}-{% endif %}</td>
                   <td>{{ user.joined_channel_at_display or "-" }}</td>
                   <td>{{ user.left_channel_at_display or "-" }}</td>
-                  <td>{% if user.invite_link %}<span class="invite-cell">{{ user.invite_link }}</span>{% else %}-{% endif %}</td>
+                  <td>
+                    {% if user.invite_link %}
+                      <span class="invite-cell">{{ user.invite_link }}</span>
+                      <button class="action copy-link" type="button" data-copy="{{ user.invite_link }}" data-copy-label="Copy invite link">Copy invite link</button>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
                   <td>{{ user.notes or "-" }}</td>
                   <td>
                     <div class="actions">
@@ -361,6 +447,26 @@
                       </form>
                       <a class="action danger" href="/dashboard/users/{{ user.telegram_id }}/remove?filter={{ active_filter }}&search={{ search }}&page={{ page }}">Remove from channel</a>
                     </div>
+                    <details class="history">
+                      <summary>Approved Payment History</summary>
+                      {% if user.recent_payment_history %}
+                        <div class="history-list">
+                          {% for record in user.recent_payment_history %}
+                            <div class="history-item">
+                              <div><strong>{{ record.created_at_display or "-" }}</strong> · {{ record.action or "-" }}</div>
+                              <div class="history-meta">
+                                status: {{ record.payment_status or "-" }} · admin: {{ record.admin_id or "-" }} ·
+                                {{ record.membership_start_date or "-" }} to {{ record.expiry_date or "-" }}
+                              </div>
+                              <div>{{ record.notes or "-" }}</div>
+                            </div>
+                          {% endfor %}
+                        </div>
+                      {% else %}
+                        <p class="history-meta">No approved payment history yet.</p>
+                      {% endif %}
+                      <a class="filter" href="/dashboard/users/{{ user.telegram_id }}/history?filter={{ active_filter }}&search={{ search }}&page={{ page }}">View full history</a>
+                    </details>
                   </td>
                 </tr>
               {% endfor %}
@@ -388,9 +494,10 @@
       document.querySelectorAll("[data-copy]").forEach((button) => {
         button.addEventListener("click", async () => {
           await navigator.clipboard.writeText(button.dataset.copy);
+          const label = button.dataset.copyLabel || button.textContent;
           button.textContent = "Copied";
           window.setTimeout(() => {
-            button.textContent = "Copy ID";
+            button.textContent = label;
           }, 1200);
         });
       });
