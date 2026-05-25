@@ -44,6 +44,7 @@ create table if not exists telegram_users (
   invite_link_name text,
   invite_link_revoked boolean default false,
   invite_link_used boolean default false,
+  revoked_at timestamptz,
   joined_channel_at timestamptz,
   left_channel_at timestamptz,
   last_seen_at timestamptz,
@@ -84,6 +85,7 @@ alter table public.telegram_users add column if not exists invite_link_created_a
 alter table public.telegram_users add column if not exists invite_link_name text;
 alter table public.telegram_users add column if not exists invite_link_revoked boolean default false;
 alter table public.telegram_users add column if not exists invite_link_used boolean default false;
+alter table public.telegram_users add column if not exists revoked_at timestamptz;
 alter table public.telegram_users add column if not exists joined_channel_at timestamptz;
 alter table public.telegram_users add column if not exists left_channel_at timestamptz;
 alter table public.telegram_users add column if not exists last_seen_at timestamptz;
@@ -179,6 +181,9 @@ The local web dashboard runs on `http://localhost:8080` unless `PORT` is set.
 /pending_payments
 /user <telegram_id>
 /send_invite <telegram_id>
+/revoke_invite <telegram_id>
+/revoke_user <telegram_id>
+/revoke_link <invite_link_name>
 /approve <telegram_id>
 /reject <telegram_id>
 /ask_receipt <telegram_id>
@@ -245,6 +250,7 @@ Dashboard actions:
 - Mark inactive
 - Generate one-use invite link using Telegram Bot API for `CONTENT_CHANNEL_ID`
 - Send existing invite link
+- Revoke current invite
 - Remove from channel using a confirmation page, then Telegram ban/unban
 
 The dashboard stores signed session cookies and does not expose the Supabase service role key to the browser.
@@ -256,7 +262,8 @@ Users send payment receipts to the bot in private chat as a photo or document. T
 Invite security:
 
 - Approval reuses an existing active unused invite link instead of creating duplicates.
-- Explicit dashboard invite regeneration revokes the previous link first.
+- The dashboard refuses to generate another link while a user already has an active unused link.
+- Use `Revoke current invite`, `/revoke_user <telegram_id>`, or `/revoke_link <invite_link_name>` before generating a replacement.
 - Invite links use `member_limit=1` and expire after one hour.
 - When Telegram reports the user joined the channel, `invite_link_used` is marked `true`.
 - Recent duplicate approvals are blocked with a warning instead of generating another link.
