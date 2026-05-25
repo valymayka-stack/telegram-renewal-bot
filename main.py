@@ -587,12 +587,12 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     def is_logged_in(request: Request) -> bool:
         return bool(request.session.get("admin_authenticated"))
 
-    @app.get("/health")
-    async def health() -> dict[str, str]:
+    @app.get("/health", response_model=None)
+    async def health():
         return {"status": "ok"}
 
-    @app.get("/", response_class=HTMLResponse)
-    async def root(request: Request) -> RedirectResponse:
+    @app.get("/", response_class=HTMLResponse, response_model=None)
+    async def root(request: Request):
         if is_logged_in(request):
             return RedirectResponse(url="/dashboard", status_code=303)
         return RedirectResponse(url="/login", status_code=303)
@@ -603,7 +603,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             return RedirectResponse(url="/dashboard", status_code=303)
         return templates.TemplateResponse("login.html", {"request": request, "error": None})
 
-    @app.post("/login")
+    @app.post("/login", response_model=None)
     async def login(request: Request, password: str = Form(...)):
         if secrets.compare_digest(password, settings.admin_password):
             request.session["admin_authenticated"] = True
@@ -616,8 +616,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             status_code=401,
         )
 
-    @app.post("/logout")
-    async def logout(request: Request) -> RedirectResponse:
+    @app.post("/logout", response_model=None)
+    async def logout(request: Request):
         request.session.clear()
         return RedirectResponse(url="/login", status_code=303)
 
@@ -653,8 +653,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             },
         )
 
-    @app.post("/dashboard/users/{telegram_id}/renew/today")
-    async def dashboard_renew_today(telegram_id: int, request: Request, filter: str = "all") -> RedirectResponse:
+    @app.post("/dashboard/users/{telegram_id}/renew/today", response_model=None)
+    async def dashboard_renew_today(telegram_id: int, request: Request, filter: str = "all"):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
@@ -664,12 +664,12 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             logger.exception("Could not renew from today for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, error=f"Could not renew user: {exc}")
 
-    @app.post("/dashboard/users/{telegram_id}/renew/current-expiry")
+    @app.post("/dashboard/users/{telegram_id}/renew/current-expiry", response_model=None)
     async def dashboard_renew_current_expiry(
         telegram_id: int,
         request: Request,
         filter: str = "all",
-    ) -> RedirectResponse:
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
@@ -682,8 +682,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             logger.exception("Could not renew from current expiry for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, error=f"Could not renew from current expiry_date: {exc}")
 
-    @app.post("/dashboard/users/{telegram_id}/paid")
-    async def dashboard_mark_paid(telegram_id: int, request: Request, filter: str = "all") -> RedirectResponse:
+    @app.post("/dashboard/users/{telegram_id}/paid", response_model=None)
+    async def dashboard_mark_paid(telegram_id: int, request: Request, filter: str = "all"):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
@@ -693,8 +693,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             logger.exception("Could not mark paid telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, error=f"Could not mark paid: {exc}")
 
-    @app.post("/dashboard/users/{telegram_id}/inactive")
-    async def dashboard_mark_inactive(telegram_id: int, request: Request, filter: str = "all") -> RedirectResponse:
+    @app.post("/dashboard/users/{telegram_id}/inactive", response_model=None)
+    async def dashboard_mark_inactive(telegram_id: int, request: Request, filter: str = "all"):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
@@ -704,8 +704,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             logger.exception("Could not mark inactive telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, error=f"Could not mark inactive: {exc}")
 
-    @app.post("/dashboard/users/{telegram_id}/invite")
-    async def dashboard_invite(telegram_id: int, request: Request, filter: str = "all") -> RedirectResponse:
+    @app.post("/dashboard/users/{telegram_id}/invite", response_model=None)
+    async def dashboard_invite(telegram_id: int, request: Request, filter: str = "all"):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
@@ -727,7 +727,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             logger.exception("Unexpected invite link error for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, error=f"Could not create invite link: {exc}")
 
-    @app.get("/dashboard/users/{telegram_id}/remove", response_class=HTMLResponse)
+    @app.get("/dashboard/users/{telegram_id}/remove", response_class=HTMLResponse, response_model=None)
     async def dashboard_remove_confirm(
         telegram_id: int,
         request: Request,
@@ -751,8 +751,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             logger.exception("Could not load remove confirmation for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, error=f"Could not load confirmation: {exc}")
 
-    @app.post("/dashboard/users/{telegram_id}/remove/confirm")
-    async def dashboard_remove_confirmed(telegram_id: int, request: Request, filter: str = "all") -> RedirectResponse:
+    @app.post("/dashboard/users/{telegram_id}/remove/confirm", response_model=None)
+    async def dashboard_remove_confirmed(telegram_id: int, request: Request, filter: str = "all"):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
