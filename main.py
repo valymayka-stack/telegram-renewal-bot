@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Form, Request
@@ -43,10 +43,25 @@ SCHEMA_MIGRATION_SQL = """
 alter table public.telegram_users add column if not exists joined_at timestamptz;
 alter table public.telegram_users add column if not exists membership_start_date date;
 alter table public.telegram_users add column if not exists payment_status text default 'unpaid';
+alter table public.telegram_users add column if not exists pending_payment_file_id text;
+alter table public.telegram_users add column if not exists pending_payment_file_type text;
+alter table public.telegram_users add column if not exists pending_payment_at timestamptz;
+alter table public.telegram_users add column if not exists approved_by_admin_id bigint;
+alter table public.telegram_users add column if not exists approved_at timestamptz;
+alter table public.telegram_users add column if not exists rejected_at timestamptz;
+alter table public.telegram_users add column if not exists needs_new_receipt_at timestamptz;
 alter table public.telegram_users add column if not exists last_payment_at timestamptz;
 alter table public.telegram_users add column if not exists invite_link text;
 alter table public.telegram_users add column if not exists invite_link_created_at timestamptz;
+alter table public.telegram_users add column if not exists invite_link_name text;
+alter table public.telegram_users add column if not exists joined_channel_at timestamptz;
+alter table public.telegram_users add column if not exists left_channel_at timestamptz;
+alter table public.telegram_users add column if not exists last_seen_at timestamptz;
+alter table public.telegram_users add column if not exists renewal_notice_7d_sent_at timestamptz;
+alter table public.telegram_users add column if not exists renewal_notice_3d_sent_at timestamptz;
+alter table public.telegram_users add column if not exists renewal_notice_1d_sent_at timestamptz;
 alter table public.telegram_users add column if not exists removed_at timestamptz;
+alter table public.telegram_users add column if not exists removal_reason text;
 alter table public.telegram_users add column if not exists confirmed_subscription boolean default false;
 alter table public.telegram_users add column if not exists confirmed_at timestamptz;
 alter table public.telegram_users add column if not exists confirmation_campaign text;
@@ -86,6 +101,8 @@ class Settings:
     content_channel_id: int | str
     admin_user_ids: set[int]
     admin_password: str
+    auto_remove_expired: bool
+    renewal_notice_days: tuple[int, ...]
 
 
 def configure_logging() -> None:
@@ -127,6 +144,24 @@ def parse_admin_ids(value: str) -> set[int]:
     return admin_ids
 
 
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_notice_days(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return (7, 3, 1)
+    days: list[int] = []
+    for raw_day in value.split(","):
+        raw_day = raw_day.strip()
+        if not raw_day:
+            continue
+        days.append(int(raw_day))
+    return tuple(days or [7, 3, 1])
+
+
 def load_settings() -> Settings:
     load_dotenv()
     return Settings(
@@ -137,11 +172,17 @@ def load_settings() -> Settings:
         content_channel_id=parse_chat_id(required_env("CONTENT_CHANNEL_ID")),
         admin_user_ids=parse_admin_ids(required_env("ADMIN_USER_IDS")),
         admin_password=required_env("ADMIN_PASSWORD"),
+        auto_remove_expired=parse_bool(os.getenv("AUTO_REMOVE_EXPIRED"), default=False),
+        renewal_notice_days=parse_notice_days(os.getenv("RENEWAL_NOTICE_DAYS")),
     )
 
 
 def is_admin(message: Message, settings: Settings) -> bool:
     return bool(message.from_user and message.from_user.id in settings.admin_user_ids)
+
+
+def is_admin_id(user_id: int | None, settings: Settings) -> bool:
+    return bool(user_id and user_id in settings.admin_user_ids)
 
 
 async def reject_non_admin(message: Message) -> None:
@@ -215,6 +256,15 @@ def format_user(row: dict[str, Any]) -> str:
     return f"{telegram_id} | {handle} | {full_name} | status: {status} | vence: {expiry}"
 
 
+def format_user_record(row: dict[str, Any]) -> str:
+    if not row:
+        return "Usuario no encontrado."
+    lines = []
+    for key in sorted(row.keys()):
+        lines.append(f"{key}: {row.get(key)}")
+    return "\n".join(lines)
+
+
 def get_registered_user(supabase: Client, telegram_id: int) -> dict[str, Any] | None:
     response = (
         supabase.table("telegram_users")
@@ -224,6 +274,22 @@ def get_registered_user(supabase: Client, telegram_id: int) -> dict[str, Any] | 
         .execute()
     )
     return response.data[0] if response.data else None
+
+
+def upsert_user_payload(supabase: Client, telegram_id: int, payload: dict[str, Any]) -> None:
+    existing = get_registered_user(supabase, telegram_id)
+    if existing:
+        (
+            supabase.table("telegram_users")
+            .update(payload)
+            .eq("telegram_id", telegram_id)
+            .execute()
+        )
+        return
+    payload.setdefault("telegram_id", telegram_id)
+    payload.setdefault("registered_at", now_utc_iso())
+    payload.setdefault("joined_at", payload["registered_at"])
+    supabase.table("telegram_users").insert(payload).execute()
 
 
 def run_schema_migration(supabase: Client) -> None:
@@ -240,6 +306,16 @@ def list_dashboard_users(
     query = supabase.table("telegram_users").select("*")
     if user_filter == "active":
         query = query.eq("status", "active")
+    elif user_filter == "pending_payments":
+        query = query.eq("payment_status", "pending_review")
+    elif user_filter == "paid":
+        query = query.eq("payment_status", "paid")
+    elif user_filter == "needs_new_receipt":
+        query = query.eq("payment_status", "needs_new_receipt")
+    elif user_filter == "rejected":
+        query = query.eq("payment_status", "rejected")
+    elif user_filter == "removed_inactive":
+        query = query.eq("status", "inactive")
     elif user_filter == "confirmed":
         query = query.eq("confirmed_subscription", True)
     elif user_filter == "source_confirm_subscription":
@@ -272,6 +348,8 @@ def list_dashboard_users(
         row["days_remaining"] = days_remaining(row.get("expiry_date"))
         row["joined_at_display"] = format_local_datetime(row.get("joined_at"))
         row["confirmed_at_display"] = format_local_datetime(row.get("confirmed_at"))
+        row["joined_channel_at_display"] = format_local_datetime(row.get("joined_channel_at"))
+        row["left_channel_at_display"] = format_local_datetime(row.get("left_channel_at"))
         row["membership_start_date_effective"] = membership_start_for_user(row).isoformat()
 
     total = len(rows)
@@ -349,6 +427,209 @@ def mark_user_paid(supabase: Client, telegram_id: int) -> None:
         .eq("telegram_id", telegram_id)
         .execute()
     )
+
+
+def pending_payment_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Aprobar ✅", callback_data=f"payment:approve:{telegram_id}"),
+                InlineKeyboardButton(text="Rechazar ❌", callback_data=f"payment:reject:{telegram_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Pedir otra captura 🔁", callback_data=f"payment:ask_receipt:{telegram_id}"),
+            ],
+        ]
+    )
+
+
+async def create_one_use_invite_link(bot: Bot, settings: Settings, telegram_id: int) -> tuple[str, str]:
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    name = f"approved-{telegram_id}-{timestamp}"
+    invite = await bot.create_chat_invite_link(
+        chat_id=settings.content_channel_id,
+        name=name,
+        member_limit=1,
+    )
+    return invite.invite_link, name
+
+
+async def save_invite_link(
+    supabase: Client,
+    telegram_id: int,
+    invite_link: str,
+    invite_link_name: str,
+    notes: str = "One-use invite link generated",
+) -> None:
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {
+            "telegram_id": telegram_id,
+            "invite_link": invite_link,
+            "invite_link_created_at": now_utc_iso(),
+            "invite_link_name": invite_link_name,
+            "notes": notes,
+        },
+    )
+
+
+async def send_invite_to_user(bot: Bot, telegram_id: int, invite_link: str) -> bool:
+    try:
+        await bot.send_message(
+            telegram_id,
+            f"Pago aprobado ✅ Aquí está tu link privado de acceso: {invite_link}\n"
+            "Este link es personal y de un solo uso.",
+        )
+        return True
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM invite link to telegram_id=%s", telegram_id, exc_info=True)
+        return False
+
+
+async def approve_payment(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+    admin_id: int,
+) -> str:
+    today = datetime.now(APP_TIMEZONE).date()
+    expiry = today + timedelta(days=30)
+    invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {
+            "telegram_id": telegram_id,
+            "status": "active",
+            "payment_status": "paid",
+            "approved_by_admin_id": admin_id,
+            "approved_at": now_utc_iso(),
+            "membership_start_date": today.isoformat(),
+            "expiry_date": expiry.isoformat(),
+            "last_payment_at": now_utc_iso(),
+            "invite_link": invite_link,
+            "invite_link_created_at": now_utc_iso(),
+            "invite_link_name": invite_name,
+            "notes": "Payment approved by admin",
+        },
+    )
+    dm_sent = await send_invite_to_user(bot, telegram_id, invite_link)
+    if dm_sent:
+        await bot.send_message(settings.admin_chat_id, f"Pago aprobado y link enviado a {telegram_id}")
+    else:
+        await bot.send_message(
+            settings.admin_chat_id,
+            "No pude enviar el link. El usuario debe abrir el bot o escribirle primero.",
+        )
+    logger.info("Payment approved telegram_id=%s admin_id=%s dm_sent=%s", telegram_id, admin_id, dm_sent)
+    return invite_link
+
+
+async def reject_payment(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> None:
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {
+            "telegram_id": telegram_id,
+            "payment_status": "rejected",
+            "rejected_at": now_utc_iso(),
+            "notes": "Payment rejected by admin",
+        },
+    )
+    try:
+        await bot.send_message(
+            telegram_id,
+            "Tu comprobante no pudo ser validado. Revisa la información y vuelve a intentarlo.",
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM rejection to telegram_id=%s", telegram_id, exc_info=True)
+    await bot.send_message(settings.admin_chat_id, f"Comprobante rechazado para {telegram_id}")
+    logger.info("Payment rejected telegram_id=%s", telegram_id)
+
+
+async def ask_new_receipt(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> None:
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {
+            "telegram_id": telegram_id,
+            "payment_status": "needs_new_receipt",
+            "needs_new_receipt_at": now_utc_iso(),
+            "notes": "Admin requested another receipt",
+        },
+    )
+    try:
+        await bot.send_message(telegram_id, "Por favor envía otra captura más clara del comprobante.")
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM receipt request to telegram_id=%s", telegram_id, exc_info=True)
+    await bot.send_message(settings.admin_chat_id, f"Se pidió otra captura a {telegram_id}")
+    logger.info("New receipt requested telegram_id=%s", telegram_id)
+
+
+async def create_or_send_existing_invite(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+) -> str:
+    user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    invite_link = user.get("invite_link") if user else None
+    if not invite_link:
+        invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
+        await save_invite_link(supabase, telegram_id, invite_link, invite_name, "Invite link generated by admin")
+    sent = await send_invite_to_user(bot, telegram_id, invite_link)
+    if not sent:
+        await bot.send_message(
+            settings.admin_chat_id,
+            "No pude enviar el link. El usuario debe abrir el bot o escribirle primero.",
+        )
+    logger.info("Invite send attempted telegram_id=%s sent=%s", telegram_id, sent)
+    return invite_link
+
+
+def expired_active_users(supabase: Client) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("telegram_users")
+        .select("*")
+        .eq("status", "active")
+        .lt("expiry_date", today_iso())
+        .execute()
+    )
+    return response.data or []
+
+
+async def remove_user_from_channel(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+    reason: str,
+) -> None:
+    await bot.ban_chat_member(chat_id=settings.content_channel_id, user_id=telegram_id)
+    await bot.unban_chat_member(
+        chat_id=settings.content_channel_id,
+        user_id=telegram_id,
+        only_if_banned=True,
+    )
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {
+            "telegram_id": telegram_id,
+            "status": "inactive",
+            "removed_at": now_utc_iso(),
+            "removal_reason": reason,
+            "notes": "Removed from channel",
+        },
+    )
+    logger.info("Removed telegram_id=%s reason=%s", telegram_id, reason)
 
 
 def mark_user_inactive(supabase: Client, telegram_id: int, notes: str = "Marked inactive from dashboard") -> None:
@@ -435,6 +716,7 @@ def mark_user_removed(supabase: Client, telegram_id: int) -> None:
             {
                 "status": "inactive",
                 "removed_at": now_utc_iso(),
+                "removal_reason": "dashboard_remove",
                 "notes": "Removed from channel from dashboard",
             }
         )
@@ -598,6 +880,58 @@ async def send_confirm_subscription(message: Message, settings: Settings) -> Non
     await message.answer("Mensaje de confirmación enviado al canal.")
 
 
+@router.message(F.chat.type == "private", (F.photo | F.document))
+async def receive_payment_receipt(message: Message, settings: Settings, supabase: Client) -> None:
+    if message.from_user and message.from_user.id in settings.admin_user_ids:
+        return
+    if not message.from_user:
+        return
+
+    now = now_utc_iso()
+    file_type = "photo" if message.photo else "document"
+    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    user = message.from_user
+    payload = {
+        "telegram_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "payment_status": "pending_review",
+        "pending_payment_file_id": file_id,
+        "pending_payment_file_type": file_type,
+        "pending_payment_at": now,
+        "source": "payment_receipt_private_bot",
+        "last_seen_at": now,
+        "notes": "Payment receipt submitted privately",
+    }
+    await asyncio.to_thread(upsert_user_payload, supabase, user.id, payload)
+    await message.answer("Comprobante recibido ✅ Lo revisaremos manualmente.")
+
+    username = f"@{user.username}" if user.username else "-"
+    admin_text = (
+        "Nuevo comprobante pendiente\n"
+        f"telegram_id: {user.id}\n"
+        f"username: {username}\n"
+        f"first_name: {user.first_name or '-'}\n"
+        f"last_name: {user.last_name or '-'}\n"
+        f"pending_payment_at: {now}"
+    )
+    try:
+        await message.bot.copy_message(
+            chat_id=settings.admin_chat_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await message.bot.send_message(
+            settings.admin_chat_id,
+            admin_text,
+            reply_markup=pending_payment_keyboard(user.id),
+        )
+        logger.info("Payment receipt submitted telegram_id=%s", user.id)
+    except Exception:
+        logger.exception("Could not notify admin about payment receipt telegram_id=%s", user.id)
+
+
 @router.message(Command("users"))
 async def users(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -631,6 +965,16 @@ async def users(message: Message, settings: Settings, supabase: Client) -> None:
     await send_long_message(message, "\n".join(lines))
 
 
+def command_telegram_id(message: Message) -> int | None:
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
 @router.message(Command("unconfirmed"))
 async def unconfirmed(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -658,6 +1002,105 @@ async def unconfirmed(message: Message, settings: Settings, supabase: Client) ->
     if not rows:
         lines.append("Todos los usuarios están confirmados.")
     await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("pending_payments"))
+async def pending_payments(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    try:
+        response = (
+            supabase.table("telegram_users")
+            .select("*")
+            .eq("payment_status", "pending_review")
+            .order("pending_payment_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("Could not fetch pending payments")
+        await message.answer(f"No pude consultar pagos pendientes: {exc}")
+        return
+    rows = response.data or []
+    lines = [f"Pagos pendientes: {len(rows)}"]
+    lines.extend(format_user(row) for row in rows)
+    if not rows:
+        lines.append("No hay pagos pendientes.")
+    await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("user"))
+async def user_record(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /user <telegram_id>")
+        return
+    row = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    await send_long_message(message, format_user_record(row or {}))
+
+
+@router.message(Command("send_invite"))
+async def send_invite(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /send_invite <telegram_id>")
+        return
+    try:
+        await create_or_send_existing_invite(message.bot, supabase, settings, telegram_id)
+        await message.answer(f"Link enviado o guardado para {telegram_id}.")
+    except Exception as exc:
+        logger.exception("Could not send invite telegram_id=%s", telegram_id)
+        await message.answer(f"No pude enviar/generar link: {exc}")
+
+
+@router.message(Command("approve"))
+async def approve_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None or not message.from_user:
+        await message.answer("Uso: /approve <telegram_id>")
+        return
+    try:
+        await approve_payment(message.bot, supabase, settings, telegram_id, message.from_user.id)
+        await message.answer(f"Pago aprobado para {telegram_id}.")
+    except Exception as exc:
+        logger.exception("Could not approve telegram_id=%s", telegram_id)
+        await message.answer(f"No pude aprobar: {exc}")
+
+
+@router.message(Command("reject"))
+async def reject_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /reject <telegram_id>")
+        return
+    await reject_payment(message.bot, supabase, settings, telegram_id)
+    await message.answer(f"Pago rechazado para {telegram_id}.")
+
+
+@router.message(Command("ask_receipt"))
+async def ask_receipt_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /ask_receipt <telegram_id>")
+        return
+    await ask_new_receipt(message.bot, supabase, settings, telegram_id)
+    await message.answer(f"Se pidió otra captura a {telegram_id}.")
 
 
 @router.message(Command("set_expiry"))
@@ -704,25 +1147,52 @@ async def expired(message: Message, settings: Settings, supabase: Client) -> Non
         return
 
     try:
-        response = (
-            supabase.table("telegram_users")
-            .select("*")
-            .lt("expiry_date", today_iso())
-            .order("expiry_date")
-            .limit(100)
-            .execute()
-        )
+        rows = await asyncio.to_thread(expired_active_users, supabase)
     except Exception as exc:
         logger.exception("Could not fetch expired users")
         await message.answer(f"No pude consultar expirados: {exc}")
         return
 
-    rows = response.data or []
-    lines = [f"Usuarios expirados al {today_iso()}: {len(rows)}"]
+    lines = [f"Usuarios activos expirados al {today_iso()}: {len(rows)}"]
     lines.extend(format_user(row) for row in rows)
     if not rows:
-        lines.append("No hay usuarios expirados.")
+        lines.append("No hay usuarios activos expirados.")
     await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("remove_expired_preview"))
+async def remove_expired_preview(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    rows = await asyncio.to_thread(expired_active_users, supabase)
+    lines = [f"Usuarios que serían removidos: {len(rows)}"]
+    lines.extend(format_user(row) for row in rows)
+    if not rows:
+        lines.append("No hay usuarios para remover.")
+    await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("remove_expired_confirm"))
+async def remove_expired_confirm(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    rows = await asyncio.to_thread(expired_active_users, supabase)
+    removed = 0
+    errors: list[str] = []
+    for row in rows:
+        telegram_id = int(row["telegram_id"])
+        try:
+            await remove_user_from_channel(message.bot, supabase, settings, telegram_id, "expired_manual_confirm")
+            removed += 1
+        except Exception as exc:
+            logger.exception("Could not remove expired telegram_id=%s", telegram_id)
+            errors.append(f"{telegram_id}: {exc}")
+    text = f"Removidos: {removed}/{len(rows)}"
+    if errors:
+        text += "\nErrores:\n" + "\n".join(errors[:10])
+    await send_long_message(message, text)
 
 
 @router.message(Command("sync_schema"))
@@ -767,32 +1237,152 @@ async def confirm_subscription(callback_query: CallbackQuery, supabase: Client) 
         await callback_query.answer("Intenta de nuevo.", show_alert=False)
 
 
+@router.callback_query(F.data.startswith("payment:"))
+async def payment_admin_callback(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not is_admin_id(callback_query.from_user.id if callback_query.from_user else None, settings):
+        await callback_query.answer("No autorizado.", show_alert=True)
+        return
+    parts = (callback_query.data or "").split(":")
+    if len(parts) != 3:
+        await callback_query.answer("Acción inválida.", show_alert=True)
+        return
+    action = parts[1]
+    try:
+        telegram_id = int(parts[2])
+    except ValueError:
+        await callback_query.answer("Usuario inválido.", show_alert=True)
+        return
+
+    try:
+        if action == "approve":
+            await approve_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
+            await callback_query.answer("Aprobado ✅")
+        elif action == "reject":
+            await reject_payment(callback_query.bot, supabase, settings, telegram_id)
+            await callback_query.answer("Rechazado ❌")
+        elif action == "ask_receipt":
+            await ask_new_receipt(callback_query.bot, supabase, settings, telegram_id)
+            await callback_query.answer("Solicitud enviada 🔁")
+        else:
+            await callback_query.answer("Acción inválida.", show_alert=True)
+            return
+    except Exception as exc:
+        logger.exception("Payment admin action failed action=%s telegram_id=%s", action, telegram_id)
+        await callback_query.answer(f"Error: {exc}", show_alert=True)
+
+
+@router.chat_member()
+async def track_channel_membership(update: ChatMemberUpdated, settings: Settings, supabase: Client) -> None:
+    channel_matches = update.chat.id == settings.content_channel_id
+    if isinstance(settings.content_channel_id, str):
+        channel_matches = update.chat.username and f"@{update.chat.username}" == settings.content_channel_id
+    if not channel_matches:
+        return
+
+    user = update.new_chat_member.user
+    old_status = update.old_chat_member.status
+    new_status = update.new_chat_member.status
+    now = now_utc_iso()
+    active_statuses = {"member", "administrator", "creator"}
+    left_statuses = {"left", "kicked"}
+    payload = {
+        "telegram_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "last_seen_at": now,
+    }
+    if new_status in active_statuses and old_status not in active_statuses:
+        payload.update({"joined_channel_at": now, "status": "active", "source": "channel_join"})
+    elif new_status in left_statuses:
+        existing = await asyncio.to_thread(get_registered_user, supabase, user.id)
+        current = bool(existing and existing.get("payment_status") == "paid" and days_remaining(existing.get("expiry_date")) is not None and days_remaining(existing.get("expiry_date")) >= 0)
+        payload.update(
+            {
+                "left_channel_at": now,
+                "notes": "Left channel or removed",
+            }
+        )
+        if not current:
+            payload["status"] = "inactive"
+    else:
+        return
+    await asyncio.to_thread(upsert_user_payload, supabase, user.id, payload)
+    logger.info("Tracked channel membership telegram_id=%s old=%s new=%s", user.id, old_status, new_status)
+
+
+@router.my_chat_member()
+async def track_bot_channel_membership(update: ChatMemberUpdated, settings: Settings) -> None:
+    channel_matches = update.chat.id == settings.content_channel_id
+    if isinstance(settings.content_channel_id, str):
+        channel_matches = update.chat.username and f"@{update.chat.username}" == settings.content_channel_id
+    if channel_matches:
+        logger.info(
+            "Bot membership changed in content channel old=%s new=%s",
+            update.old_chat_member.status,
+            update.new_chat_member.status,
+        )
+
+
 @router.error()
 async def handle_error(event: ErrorEvent) -> None:
     logger.exception("Unhandled update error: %s", event.exception)
 
 
 async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) -> None:
-    today = today_iso()
+    today = datetime.now(APP_TIMEZONE).date()
     try:
-        response = (
-            supabase.table("telegram_users")
-            .select("*")
-            .eq("expiry_date", today)
-            .order("registered_at", desc=True)
-            .execute()
-        )
-        rows = response.data or []
-        if not rows:
-            text = f"No hay usuarios venciendo hoy ({today})."
-        else:
-            lines = [f"Usuarios venciendo hoy ({today}): {len(rows)}"]
-            lines.extend(format_user(row) for row in rows)
-            text = "\n".join(lines)
+        sections: list[str] = []
+        for notice_day in settings.renewal_notice_days:
+            target = (today + timedelta(days=notice_day)).isoformat()
+            column = f"renewal_notice_{notice_day}d_sent_at"
+            response = (
+                supabase.table("telegram_users")
+                .select("*")
+                .eq("status", "active")
+                .eq("expiry_date", target)
+                .is_(column, "null")
+                .execute()
+            )
+            rows = response.data or []
+            if rows:
+                sections.append(f"Expiran en {notice_day} días ({target}): {len(rows)}")
+                sections.extend(format_user(row) for row in rows)
+                ids = [row["telegram_id"] for row in rows]
+                (
+                    supabase.table("telegram_users")
+                    .update({column: now_utc_iso()})
+                    .in_("telegram_id", ids)
+                    .execute()
+                )
+
+        expired_rows = await asyncio.to_thread(expired_active_users, supabase)
+        sections.append(f"Usuarios activos expirados: {len(expired_rows)}")
+        sections.extend(format_user(row) for row in expired_rows)
+
+        if settings.auto_remove_expired and expired_rows:
+            removed = 0
+            for row in expired_rows:
+                try:
+                    await remove_user_from_channel(
+                        bot,
+                        supabase,
+                        settings,
+                        int(row["telegram_id"]),
+                        "expired_auto_remove",
+                    )
+                    removed += 1
+                except Exception:
+                    logger.exception("Auto remove failed telegram_id=%s", row.get("telegram_id"))
+            sections.append(f"AUTO_REMOVE_EXPIRED=true, removidos: {removed}/{len(expired_rows)}")
+        elif expired_rows:
+            sections.append("AUTO_REMOVE_EXPIRED=false, no se removió a nadie.")
+
+        text = "\n".join(sections) if sections else f"Sin avisos de renovación para {today.isoformat()}."
         await bot.send_message(settings.admin_chat_id, text[:3900])
-        logger.info("Sent daily expiry notification with %s users", len(rows))
+        logger.info("Sent daily renewal notification")
     except Exception:
-        logger.exception("Could not send daily expiry notification")
+        logger.exception("Could not send daily renewal notification")
 
 
 async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> None:
@@ -910,6 +1500,11 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             in {
                 "all",
                 "active",
+                "pending_payments",
+                "paid",
+                "needs_new_receipt",
+                "rejected",
+                "removed_inactive",
                 "confirmed",
                 "not_confirmed",
                 "source_confirm_subscription",
@@ -1044,6 +1639,49 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             logger.exception("Could not set membership start for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, search, page, error=f"Could not set membership start date: {exc}")
 
+    @app.post("/dashboard/users/{telegram_id}/approve-payment", response_model=None)
+    async def dashboard_approve_payment(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        try:
+            await approve_payment(bot, supabase, settings, telegram_id, next(iter(settings.admin_user_ids)))
+            return dashboard_redirect(filter, search, page, message=f"Payment approved for {telegram_id}.")
+        except Exception as exc:
+            logger.exception("Dashboard approve failed telegram_id=%s", telegram_id)
+            return dashboard_redirect(filter, search, page, error=f"Could not approve payment: {exc}")
+
+    @app.post("/dashboard/users/{telegram_id}/reject-payment", response_model=None)
+    async def dashboard_reject_payment(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        await reject_payment(bot, supabase, settings, telegram_id)
+        return dashboard_redirect(filter, search, page, message=f"Payment rejected for {telegram_id}.")
+
+    @app.post("/dashboard/users/{telegram_id}/ask-receipt", response_model=None)
+    async def dashboard_ask_receipt(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        await ask_new_receipt(bot, supabase, settings, telegram_id)
+        return dashboard_redirect(filter, search, page, message=f"Requested another receipt from {telegram_id}.")
+
     @app.post("/dashboard/users/{telegram_id}/confirmed", response_model=None)
     async def dashboard_mark_confirmed(
         telegram_id: int,
@@ -1106,22 +1744,35 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
-            invite = await bot.create_chat_invite_link(
-                chat_id=settings.content_channel_id,
-                name=f"dashboard-{telegram_id}-{int(datetime.now(timezone.utc).timestamp())}",
-                member_limit=1,
-            )
-            await asyncio.to_thread(update_user_invite_link, supabase, telegram_id, invite.invite_link)
+            invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
+            await save_invite_link(supabase, telegram_id, invite_link, invite_name, "Generated one-use invite link from dashboard")
             return dashboard_redirect(
                 filter,
                 search,
                 page,
                 message=f"One-use invite link generated for {telegram_id}.",
-                invite_link=invite.invite_link,
+                invite_link=invite_link,
             )
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             logger.exception("Could not create invite link for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, search, page, error=f"Could not create invite link: {exc}")
+
+    @app.post("/dashboard/users/{telegram_id}/send-existing-invite", response_model=None)
+    async def dashboard_send_existing_invite(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        try:
+            await create_or_send_existing_invite(bot, supabase, settings, telegram_id)
+            return dashboard_redirect(filter, search, page, message=f"Invite send attempted for {telegram_id}.")
+        except Exception as exc:
+            logger.exception("Dashboard send invite failed telegram_id=%s", telegram_id)
+            return dashboard_redirect(filter, search, page, error=f"Could not send invite: {exc}")
         except Exception as exc:
             logger.exception("Unexpected invite link error for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, search, page, error=f"Could not create invite link: {exc}")
