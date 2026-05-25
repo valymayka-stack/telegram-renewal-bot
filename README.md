@@ -42,6 +42,8 @@ create table if not exists telegram_users (
   invite_link text,
   invite_link_created_at timestamptz,
   invite_link_name text,
+  invite_link_revoked boolean default false,
+  invite_link_used boolean default false,
   joined_channel_at timestamptz,
   left_channel_at timestamptz,
   last_seen_at timestamptz,
@@ -80,6 +82,8 @@ alter table public.telegram_users add column if not exists last_payment_at times
 alter table public.telegram_users add column if not exists invite_link text;
 alter table public.telegram_users add column if not exists invite_link_created_at timestamptz;
 alter table public.telegram_users add column if not exists invite_link_name text;
+alter table public.telegram_users add column if not exists invite_link_revoked boolean default false;
+alter table public.telegram_users add column if not exists invite_link_used boolean default false;
 alter table public.telegram_users add column if not exists joined_channel_at timestamptz;
 alter table public.telegram_users add column if not exists left_channel_at timestamptz;
 alter table public.telegram_users add column if not exists last_seen_at timestamptz;
@@ -97,6 +101,8 @@ alter table public.telegram_users add column if not exists notes text;
 alter table public.telegram_users add column if not exists expiry_date date;
 alter table public.telegram_users alter column payment_status set default 'unpaid';
 alter table public.telegram_users alter column confirmed_subscription set default false;
+alter table public.telegram_users alter column invite_link_revoked set default false;
+alter table public.telegram_users alter column invite_link_used set default false;
 update public.telegram_users
 set joined_at = coalesce(joined_at, registered_at, now())
 where joined_at is null;
@@ -106,6 +112,12 @@ where payment_status is null;
 update public.telegram_users
 set confirmed_subscription = coalesce(confirmed_subscription, false)
 where confirmed_subscription is null;
+update public.telegram_users
+set invite_link_revoked = coalesce(invite_link_revoked, false)
+where invite_link_revoked is null;
+update public.telegram_users
+set invite_link_used = coalesce(invite_link_used, false)
+where invite_link_used is null;
 update public.telegram_users
 set expiry_date = (joined_at + interval '30 days')::date
 where expiry_date is null and membership_start_date is null and joined_at is not null;
@@ -240,6 +252,14 @@ The dashboard stores signed session cookies and does not expose the Supabase ser
 ## Payment approval and renewal jobs
 
 Users send payment receipts to the bot in private chat as a photo or document. The bot marks them `pending_review` and sends admin buttons to `ADMIN_CHAT_ID`. Invite links are generated and sent only after an admin approves the payment.
+
+Invite security:
+
+- Approval reuses an existing active unused invite link instead of creating duplicates.
+- Explicit dashboard invite regeneration revokes the previous link first.
+- Invite links use `member_limit=1` and expire after one hour.
+- When Telegram reports the user joined the channel, `invite_link_used` is marked `true`.
+- Recent duplicate approvals are blocked with a warning instead of generating another link.
 
 The bot runs an in-process scheduler while long polling is active. It sends daily renewal notices to `ADMIN_CHAT_ID` at `09:00 America/Mexico_City` for the days in `RENEWAL_NOTICE_DAYS`, includes expired users, and only removes expired active users when `AUTO_REMOVE_EXPIRED=true`.
 
