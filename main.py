@@ -54,6 +54,8 @@ alter table public.telegram_users add column if not exists last_payment_at times
 alter table public.telegram_users add column if not exists invite_link text;
 alter table public.telegram_users add column if not exists invite_link_created_at timestamptz;
 alter table public.telegram_users add column if not exists invite_link_name text;
+alter table public.telegram_users add column if not exists invite_link_revoked boolean default false;
+alter table public.telegram_users add column if not exists invite_link_used boolean default false;
 alter table public.telegram_users add column if not exists joined_channel_at timestamptz;
 alter table public.telegram_users add column if not exists left_channel_at timestamptz;
 alter table public.telegram_users add column if not exists last_seen_at timestamptz;
@@ -71,6 +73,8 @@ alter table public.telegram_users add column if not exists notes text;
 alter table public.telegram_users add column if not exists expiry_date date;
 alter table public.telegram_users alter column payment_status set default 'unpaid';
 alter table public.telegram_users alter column confirmed_subscription set default false;
+alter table public.telegram_users alter column invite_link_revoked set default false;
+alter table public.telegram_users alter column invite_link_used set default false;
 update public.telegram_users
 set joined_at = coalesce(joined_at, registered_at, now())
 where joined_at is null;
@@ -80,6 +84,12 @@ where payment_status is null;
 update public.telegram_users
 set confirmed_subscription = coalesce(confirmed_subscription, false)
 where confirmed_subscription is null;
+update public.telegram_users
+set invite_link_revoked = coalesce(invite_link_revoked, false)
+where invite_link_revoked is null;
+update public.telegram_users
+set invite_link_used = coalesce(invite_link_used, false)
+where invite_link_used is null;
 update public.telegram_users
 set expiry_date = (joined_at + interval '30 days')::date
 where expiry_date is null and membership_start_date is null and joined_at is not null;
@@ -226,6 +236,18 @@ def format_local_datetime(value: Any) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(APP_TIMEZONE).strftime("%d/%m/%Y %H:%M")
+
+
+def parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def membership_start_for_user(row: dict[str, Any]) -> date:
@@ -450,8 +472,29 @@ async def create_one_use_invite_link(bot: Bot, settings: Settings, telegram_id: 
         chat_id=settings.content_channel_id,
         name=name,
         member_limit=1,
+        expire_date=datetime.now(timezone.utc) + timedelta(hours=1),
     )
     return invite.invite_link, name
+
+
+def has_active_unused_invite(row: dict[str, Any] | None) -> bool:
+    if not row or not row.get("invite_link"):
+        return False
+    if row.get("invite_link_revoked") is True or row.get("invite_link_used") is True:
+        return False
+    created_at = parse_iso_datetime(row.get("invite_link_created_at"))
+    if not created_at:
+        return False
+    return datetime.now(timezone.utc) - created_at < timedelta(hours=1)
+
+
+def payment_recently_approved(row: dict[str, Any] | None) -> bool:
+    if not row or row.get("payment_status") != "paid":
+        return False
+    approved_at = parse_iso_datetime(row.get("approved_at"))
+    if not approved_at:
+        return False
+    return datetime.now(timezone.utc) - approved_at < timedelta(hours=1)
 
 
 async def save_invite_link(
@@ -470,9 +513,35 @@ async def save_invite_link(
             "invite_link": invite_link,
             "invite_link_created_at": now_utc_iso(),
             "invite_link_name": invite_link_name,
+            "invite_link_revoked": False,
+            "invite_link_used": False,
             "notes": notes,
         },
     )
+
+
+async def revoke_existing_invite_link(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> None:
+    user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    if not user or not user.get("invite_link") or user.get("invite_link_revoked") is True:
+        return
+    try:
+        await bot.revoke_chat_invite_link(settings.content_channel_id, user["invite_link"])
+        logger.info("Revoked previous invite link telegram_id=%s", telegram_id)
+    except TelegramBadRequest:
+        logger.warning("Could not revoke previous invite link telegram_id=%s", telegram_id, exc_info=True)
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {"telegram_id": telegram_id, "invite_link_revoked": True},
+    )
+
+
+async def regenerate_invite_link(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> str:
+    await revoke_existing_invite_link(bot, supabase, settings, telegram_id)
+    invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
+    await save_invite_link(supabase, telegram_id, invite_link, invite_name, "Invite link regenerated by admin")
+    return invite_link
 
 
 async def send_invite_to_user(bot: Bot, telegram_id: int, invite_link: str) -> bool:
@@ -494,28 +563,54 @@ async def approve_payment(
     settings: Settings,
     telegram_id: int,
     admin_id: int,
-) -> str:
+) -> dict[str, Any]:
+    existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    if payment_recently_approved(existing_user):
+        if has_active_unused_invite(existing_user):
+            invite_link = existing_user["invite_link"]
+            dm_sent = await send_invite_to_user(bot, telegram_id, invite_link)
+            if dm_sent:
+                await bot.send_message(settings.admin_chat_id, f"Pago ya aprobado recientemente; reenvié el link existente a {telegram_id}")
+            else:
+                await bot.send_message(
+                    settings.admin_chat_id,
+                    "Pago ya aprobado recientemente. No pude reenviar el link; el usuario debe abrir el bot o escribirle primero.",
+                )
+            logger.warning("Duplicate approval prevented telegram_id=%s active_link_reused=true", telegram_id)
+            return {"invite_link": invite_link, "duplicate": True, "reused": True}
+        logger.warning("Duplicate approval prevented telegram_id=%s active_link_reused=false", telegram_id)
+        raise ValueError("Payment already approved recently; not generating another invite link.")
+
     today = datetime.now(APP_TIMEZONE).date()
     expiry = today + timedelta(days=30)
-    invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
+    reused_invite = has_active_unused_invite(existing_user)
+    if reused_invite:
+        invite_link = existing_user["invite_link"]
+        invite_name = existing_user.get("invite_link_name") or f"existing-{telegram_id}"
+    else:
+        invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
+    approval_payload = {
+        "telegram_id": telegram_id,
+        "status": "active",
+        "payment_status": "paid",
+        "approved_by_admin_id": admin_id,
+        "approved_at": now_utc_iso(),
+        "membership_start_date": today.isoformat(),
+        "expiry_date": expiry.isoformat(),
+        "last_payment_at": now_utc_iso(),
+        "invite_link": invite_link,
+        "invite_link_name": invite_name,
+        "invite_link_revoked": False,
+        "invite_link_used": False,
+        "notes": "Payment approved by admin",
+    }
+    if not reused_invite:
+        approval_payload["invite_link_created_at"] = now_utc_iso()
     await asyncio.to_thread(
         upsert_user_payload,
         supabase,
         telegram_id,
-        {
-            "telegram_id": telegram_id,
-            "status": "active",
-            "payment_status": "paid",
-            "approved_by_admin_id": admin_id,
-            "approved_at": now_utc_iso(),
-            "membership_start_date": today.isoformat(),
-            "expiry_date": expiry.isoformat(),
-            "last_payment_at": now_utc_iso(),
-            "invite_link": invite_link,
-            "invite_link_created_at": now_utc_iso(),
-            "invite_link_name": invite_name,
-            "notes": "Payment approved by admin",
-        },
+        approval_payload,
     )
     dm_sent = await send_invite_to_user(bot, telegram_id, invite_link)
     if dm_sent:
@@ -526,7 +621,7 @@ async def approve_payment(
             "No pude enviar el link. El usuario debe abrir el bot o escribirle primero.",
         )
     logger.info("Payment approved telegram_id=%s admin_id=%s dm_sent=%s", telegram_id, admin_id, dm_sent)
-    return invite_link
+    return {"invite_link": invite_link, "duplicate": False, "reused": reused_invite}
 
 
 async def reject_payment(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> None:
@@ -579,7 +674,7 @@ async def create_or_send_existing_invite(
     telegram_id: int,
 ) -> str:
     user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
-    invite_link = user.get("invite_link") if user else None
+    invite_link = user.get("invite_link") if has_active_unused_invite(user) else None
     if not invite_link:
         invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
         await save_invite_link(supabase, telegram_id, invite_link, invite_name, "Invite link generated by admin")
@@ -1060,6 +1155,45 @@ async def send_invite(message: Message, settings: Settings, supabase: Client) ->
         await message.answer(f"No pude enviar/generar link: {exc}")
 
 
+@router.message(Command("revoke_invite"))
+async def revoke_invite(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /revoke_invite <telegram_id>")
+        return
+
+    user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    invite_link = user.get("invite_link") if user else None
+    if not invite_link:
+        await message.answer("No invite link found.")
+        return
+
+    try:
+        await message.bot.revoke_chat_invite_link(
+            chat_id=settings.content_channel_id,
+            invite_link=invite_link,
+        )
+        await asyncio.to_thread(
+            upsert_user_payload,
+            supabase,
+            telegram_id,
+            {
+                "telegram_id": telegram_id,
+                "invite_link_revoked": True,
+                "notes": "Invite link revoked by admin",
+            },
+        )
+    except Exception as exc:
+        logger.exception("Could not revoke invite telegram_id=%s", telegram_id)
+        await message.answer(f"No pude revocar el link: {exc}")
+        return
+
+    await message.answer("Invite link revoked.")
+
+
 @router.message(Command("approve"))
 async def approve_command(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -1070,8 +1204,11 @@ async def approve_command(message: Message, settings: Settings, supabase: Client
         await message.answer("Uso: /approve <telegram_id>")
         return
     try:
-        await approve_payment(message.bot, supabase, settings, telegram_id, message.from_user.id)
-        await message.answer(f"Pago aprobado para {telegram_id}.")
+        result = await approve_payment(message.bot, supabase, settings, telegram_id, message.from_user.id)
+        if result.get("duplicate"):
+            await message.answer(f"Pago ya aprobado recientemente; reenvié link existente para {telegram_id}.")
+        else:
+            await message.answer(f"Pago aprobado para {telegram_id}.")
     except Exception as exc:
         logger.exception("Could not approve telegram_id=%s", telegram_id)
         await message.answer(f"No pude aprobar: {exc}")
@@ -1255,8 +1392,11 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
 
     try:
         if action == "approve":
-            await approve_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
-            await callback_query.answer("Aprobado ✅")
+            result = await approve_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
+            if result.get("duplicate"):
+                await callback_query.answer("Ya estaba aprobado; reenvié el link existente.", show_alert=True)
+            else:
+                await callback_query.answer("Aprobado ✅")
         elif action == "reject":
             await reject_payment(callback_query.bot, supabase, settings, telegram_id)
             await callback_query.answer("Rechazado ❌")
@@ -1293,7 +1433,14 @@ async def track_channel_membership(update: ChatMemberUpdated, settings: Settings
         "last_seen_at": now,
     }
     if new_status in active_statuses and old_status not in active_statuses:
-        payload.update({"joined_channel_at": now, "status": "active", "source": "channel_join"})
+        payload.update(
+            {
+                "joined_channel_at": now,
+                "status": "active",
+                "source": "channel_join",
+                "invite_link_used": True,
+            }
+        )
     elif new_status in left_statuses:
         existing = await asyncio.to_thread(get_registered_user, supabase, user.id)
         current = bool(existing and existing.get("payment_status") == "paid" and days_remaining(existing.get("expiry_date")) is not None and days_remaining(existing.get("expiry_date")) >= 0)
@@ -1650,7 +1797,9 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
-            await approve_payment(bot, supabase, settings, telegram_id, next(iter(settings.admin_user_ids)))
+            result = await approve_payment(bot, supabase, settings, telegram_id, next(iter(settings.admin_user_ids)))
+            if result.get("duplicate"):
+                return dashboard_redirect(filter, search, page, message=f"Payment was already approved recently; existing link resent for {telegram_id}.")
             return dashboard_redirect(filter, search, page, message=f"Payment approved for {telegram_id}.")
         except Exception as exc:
             logger.exception("Dashboard approve failed telegram_id=%s", telegram_id)
@@ -1744,8 +1893,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
-            invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
-            await save_invite_link(supabase, telegram_id, invite_link, invite_name, "Generated one-use invite link from dashboard")
+            invite_link = await regenerate_invite_link(bot, supabase, settings, telegram_id)
             return dashboard_redirect(
                 filter,
                 search,
