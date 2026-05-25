@@ -353,6 +353,9 @@
                       <form method="post" action="/dashboard/users/{{ user.telegram_id }}/invite?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
                         <button class="action" type="submit">Generate invite link</button>
                       </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/revoke-current-invite?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
+                        <button class="action danger" type="submit">Revoke current invite</button>
+                      </form>
                       <form method="post" action="/dashboard/users/{{ user.telegram_id }}/send-existing-invite?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
                         <button class="action" type="submit">Send existing invite link</button>
                       </form>
