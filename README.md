@@ -31,10 +31,25 @@ create table if not exists telegram_users (
   membership_start_date date,
   expiry_date date,
   payment_status text default 'unpaid',
+  pending_payment_file_id text,
+  pending_payment_file_type text,
+  pending_payment_at timestamptz,
+  approved_by_admin_id bigint,
+  approved_at timestamptz,
+  rejected_at timestamptz,
+  needs_new_receipt_at timestamptz,
   last_payment_at timestamptz,
   invite_link text,
   invite_link_created_at timestamptz,
+  invite_link_name text,
+  joined_channel_at timestamptz,
+  left_channel_at timestamptz,
+  last_seen_at timestamptz,
+  renewal_notice_7d_sent_at timestamptz,
+  renewal_notice_3d_sent_at timestamptz,
+  renewal_notice_1d_sent_at timestamptz,
   removed_at timestamptz,
+  removal_reason text,
   confirmed_subscription boolean default false,
   confirmed_at timestamptz,
   confirmation_campaign text,
@@ -54,10 +69,25 @@ For existing tables, `/sync_schema` and startup migration attempt to run:
 alter table public.telegram_users add column if not exists joined_at timestamptz;
 alter table public.telegram_users add column if not exists membership_start_date date;
 alter table public.telegram_users add column if not exists payment_status text default 'unpaid';
+alter table public.telegram_users add column if not exists pending_payment_file_id text;
+alter table public.telegram_users add column if not exists pending_payment_file_type text;
+alter table public.telegram_users add column if not exists pending_payment_at timestamptz;
+alter table public.telegram_users add column if not exists approved_by_admin_id bigint;
+alter table public.telegram_users add column if not exists approved_at timestamptz;
+alter table public.telegram_users add column if not exists rejected_at timestamptz;
+alter table public.telegram_users add column if not exists needs_new_receipt_at timestamptz;
 alter table public.telegram_users add column if not exists last_payment_at timestamptz;
 alter table public.telegram_users add column if not exists invite_link text;
 alter table public.telegram_users add column if not exists invite_link_created_at timestamptz;
+alter table public.telegram_users add column if not exists invite_link_name text;
+alter table public.telegram_users add column if not exists joined_channel_at timestamptz;
+alter table public.telegram_users add column if not exists left_channel_at timestamptz;
+alter table public.telegram_users add column if not exists last_seen_at timestamptz;
+alter table public.telegram_users add column if not exists renewal_notice_7d_sent_at timestamptz;
+alter table public.telegram_users add column if not exists renewal_notice_3d_sent_at timestamptz;
+alter table public.telegram_users add column if not exists renewal_notice_1d_sent_at timestamptz;
 alter table public.telegram_users add column if not exists removed_at timestamptz;
+alter table public.telegram_users add column if not exists removal_reason text;
 alter table public.telegram_users add column if not exists confirmed_subscription boolean default false;
 alter table public.telegram_users add column if not exists confirmed_at timestamptz;
 alter table public.telegram_users add column if not exists confirmation_campaign text;
@@ -93,7 +123,7 @@ Use the Supabase service role key only on Railway/server-side infrastructure. Ne
 1. Create a bot with BotFather and copy the token.
 2. Add the bot to your content channel.
 3. Promote the bot to admin in the channel so it can send messages.
-4. Give the bot permission to invite users and ban users if you want dashboard invite/removal actions.
+4. Give the bot permission to invite users, ban users, and receive member updates for invite/removal and join/leave tracking.
 5. Disable privacy mode if you later need group command behavior.
 6. Get your numeric Telegram admin user ID and add it to `ADMIN_USER_IDS`.
 
@@ -109,6 +139,8 @@ ADMIN_CHAT_ID=123456789
 CONTENT_CHANNEL_ID=-1001234567890
 ADMIN_USER_IDS=123456789,987654321
 ADMIN_PASSWORD=use-a-long-random-password
+AUTO_REMOVE_EXPIRED=false
+RENEWAL_NOTICE_DAYS=7,3,1
 ```
 
 `CONTENT_CHANNEL_ID` can be a numeric channel ID or a public `@channelusername`.
@@ -132,8 +164,16 @@ The local web dashboard runs on `http://localhost:8080` unless `PORT` is set.
 /send_poll
 /send_confirm_subscription
 /users
+/pending_payments
+/user <telegram_id>
+/send_invite <telegram_id>
+/approve <telegram_id>
+/reject <telegram_id>
+/ask_receipt <telegram_id>
 /set_expiry <telegram_id> <YYYY-MM-DD>
 /expired
+/remove_expired_preview
+/remove_expired_confirm
 /unconfirmed
 /sync_schema
 ```
@@ -149,6 +189,7 @@ Dashboard columns:
 - `telegram_id`
 - `username`
 - `first_name`
+- `payment_status`
 - `status`
 - `confirmed_subscription`
 - `confirmed_at`
@@ -157,11 +198,18 @@ Dashboard columns:
 - `membership_start_date`
 - `expiry_date`
 - days remaining
+- `joined_channel_at`
+- `left_channel_at`
+- `invite_link`
 - `notes`
 
 Dashboard filters:
 
 - All
+- Pending payments
+- Paid
+- Needs new receipt
+- Rejected
 - Active
 - Confirmed
 - Not confirmed
@@ -169,9 +217,13 @@ Dashboard filters:
 - Expiring in 7 days
 - Expired
 - No expiry date
+- Removed/inactive
 
 Dashboard actions:
 
+- Approve pending payment
+- Reject payment
+- Ask for another receipt
 - Renew +30 days from today
 - Renew +30 days from current expiry date if still active
 - Set membership start date
@@ -180,13 +232,26 @@ Dashboard actions:
 - Mark not confirmed
 - Mark inactive
 - Generate one-use invite link using Telegram Bot API for `CONTENT_CHANNEL_ID`
+- Send existing invite link
 - Remove from channel using a confirmation page, then Telegram ban/unban
 
 The dashboard stores signed session cookies and does not expose the Supabase service role key to the browser.
 
-## Daily expiry notification
+## Payment approval and renewal jobs
 
-The bot runs an in-process scheduler while long polling is active. It sends a daily message to `ADMIN_CHAT_ID` at `09:00 America/Mexico_City` listing users whose `expiry_date` equals the current date in that timezone.
+Users send payment receipts to the bot in private chat as a photo or document. The bot marks them `pending_review` and sends admin buttons to `ADMIN_CHAT_ID`. Invite links are generated and sent only after an admin approves the payment.
+
+The bot runs an in-process scheduler while long polling is active. It sends daily renewal notices to `ADMIN_CHAT_ID` at `09:00 America/Mexico_City` for the days in `RENEWAL_NOTICE_DAYS`, includes expired users, and only removes expired active users when `AUTO_REMOVE_EXPIRED=true`.
+
+## Testing checklist
+
+1. Run `/sync_schema` or execute the SQL migration above in Supabase.
+2. Send a photo or PDF receipt to the bot in a private chat from a non-admin account.
+3. Confirm `ADMIN_CHAT_ID` receives the pending payment message with approval buttons.
+4. Click `Aprobar ✅` and verify the user receives a private one-use invite link.
+5. Join the channel with that link and confirm `joined_channel_at` updates.
+6. Test `/pending_payments`, `/user <telegram_id>`, `/remove_expired_preview`, and the dashboard filters.
+7. Keep `AUTO_REMOVE_EXPIRED=false` until manual preview/removal looks correct.
 
 ## Railway deployment
 
