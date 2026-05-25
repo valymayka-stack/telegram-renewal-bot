@@ -64,6 +64,31 @@ create index if not exists telegram_users_registered_at_idx
 
 create index if not exists telegram_users_expiry_date_idx
   on telegram_users (expiry_date);
+
+create table if not exists payment_history (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  username text,
+  first_name text,
+  admin_id bigint,
+  action text default 'approved',
+  payment_status text default 'paid',
+  receipt_file_id text,
+  invite_link text,
+  membership_start_date date,
+  expiry_date date,
+  notes text,
+  created_at timestamptz default now()
+);
+
+create index if not exists payment_history_telegram_id_idx
+  on payment_history (telegram_id);
+
+create index if not exists payment_history_created_at_idx
+  on payment_history (created_at desc);
+
+create index if not exists payment_history_payment_status_idx
+  on payment_history (payment_status);
 ```
 
 For existing tables, `/sync_schema` and startup migration attempt to run:
@@ -126,6 +151,31 @@ where expiry_date is null and membership_start_date is null and joined_at is not
 update public.telegram_users
 set expiry_date = membership_start_date + 30
 where expiry_date is null and membership_start_date is not null;
+create table if not exists public.payment_history (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  username text,
+  first_name text,
+  admin_id bigint,
+  action text default 'approved',
+  payment_status text default 'paid',
+  receipt_file_id text,
+  invite_link text,
+  membership_start_date date,
+  expiry_date date,
+  notes text,
+  created_at timestamptz default now()
+);
+alter table public.payment_history add column if not exists membership_start_date date;
+alter table public.payment_history add column if not exists expiry_date date;
+alter table public.payment_history alter column action set default 'approved';
+alter table public.payment_history alter column payment_status set default 'paid';
+create index if not exists payment_history_telegram_id_idx
+  on public.payment_history (telegram_id);
+create index if not exists payment_history_created_at_idx
+  on public.payment_history (created_at desc);
+create index if not exists payment_history_payment_status_idx
+  on public.payment_history (payment_status);
 ```
 
 Supabase REST does not expose DDL by default. To let the bot run this automatically, create a tightly controlled `exec_sql` RPC for your server-side service role, or run the SQL manually in the Supabase SQL editor.
@@ -180,6 +230,7 @@ The local web dashboard runs on `http://localhost:8080` unless `PORT` is set.
 /users
 /pending_payments
 /user <telegram_id>
+/payment_history <telegram_id>
 /send_invite <telegram_id>
 /revoke_invite <telegram_id>
 /revoke_user <telegram_id>
@@ -219,6 +270,7 @@ Dashboard columns:
 - `left_channel_at`
 - `invite_link`
 - `notes`
+- latest 5 payment history records per user row
 
 Dashboard filters:
 
@@ -234,6 +286,7 @@ Dashboard filters:
 - Expiring in 7 days
 - Expired
 - No expiry date
+- Has payment history
 - Removed/inactive
 
 Dashboard actions:
@@ -258,6 +311,14 @@ The dashboard stores signed session cookies and does not expose the Supabase ser
 ## Payment approval and renewal jobs
 
 Users send payment receipts to the bot in private chat as a photo or document. The bot marks them `pending_review` and sends admin buttons to `ADMIN_CHAT_ID`. Invite links are generated and sent only after an admin approves the payment.
+
+Payment history:
+
+- Only approved payments are appended to `payment_history`.
+- Pending receipts, rejected receipts, requests for another capture, and invite revocations are not stored as payment history.
+- Receipt image file IDs are not copied into payment history rows.
+- Payment history writes are best-effort: if the history table is unavailable, the main payment flow continues and the bot logs a warning.
+- Use `/payment_history <telegram_id>` or `/dashboard/users/{telegram_id}/history` to review approved payment history for one user.
 
 Invite security:
 
