@@ -29,22 +29,48 @@ CTA_MESSAGE = "¿Quieres ver más contenido como este? 🔥"
 CTA_BUTTON_TEXT = "QUIERO MÁS CONTENIDO 🔥"
 CTA_CALLBACK_DATA = "want_more_content"
 CTA_NOTES = "Clicked QUIERO MÁS CONTENIDO button"
+CONFIRM_SUBSCRIPTION_MESSAGE = (
+    "Bebes, para llevar mejor control, den click aquí para confirmar su suscripción 💕  \n"
+    "Es importante dar click, si no, pueden llegar a ser removidos del canal."
+)
+CONFIRM_SUBSCRIPTION_BUTTON_TEXT = "CONFIRMAR SUSCRIPCIÓN ✅"
+CONFIRM_SUBSCRIPTION_CALLBACK_DATA = "confirm_subscription_v1"
+CONFIRMATION_CAMPAIGN = "subscription_confirmation_v1"
+CONFIRMATION_SOURCE = "confirm_subscription_button"
 DATE_FORMAT = "%Y-%m-%d"
 APP_TIMEZONE = ZoneInfo("America/Mexico_City")
 SCHEMA_MIGRATION_SQL = """
 alter table public.telegram_users add column if not exists joined_at timestamptz;
+alter table public.telegram_users add column if not exists membership_start_date date;
+alter table public.telegram_users add column if not exists payment_status text default 'unpaid';
 alter table public.telegram_users add column if not exists last_payment_at timestamptz;
 alter table public.telegram_users add column if not exists invite_link text;
+alter table public.telegram_users add column if not exists invite_link_created_at timestamptz;
 alter table public.telegram_users add column if not exists removed_at timestamptz;
+alter table public.telegram_users add column if not exists confirmed_subscription boolean default false;
+alter table public.telegram_users add column if not exists confirmed_at timestamptz;
+alter table public.telegram_users add column if not exists confirmation_campaign text;
+alter table public.telegram_users add column if not exists source text;
 alter table public.telegram_users add column if not exists status text;
 alter table public.telegram_users add column if not exists notes text;
 alter table public.telegram_users add column if not exists expiry_date date;
+alter table public.telegram_users alter column payment_status set default 'unpaid';
+alter table public.telegram_users alter column confirmed_subscription set default false;
 update public.telegram_users
 set joined_at = coalesce(joined_at, registered_at, now())
 where joined_at is null;
 update public.telegram_users
+set payment_status = coalesce(payment_status, 'unpaid')
+where payment_status is null;
+update public.telegram_users
+set confirmed_subscription = coalesce(confirmed_subscription, false)
+where confirmed_subscription is null;
+update public.telegram_users
 set expiry_date = (joined_at + interval '30 days')::date
-where expiry_date is null and joined_at is not null;
+where expiry_date is null and membership_start_date is null and joined_at is not null;
+update public.telegram_users
+set expiry_date = membership_start_date + 30
+where expiry_date is null and membership_start_date is not null;
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -149,6 +175,28 @@ def days_remaining(expiry_date: Any) -> int | None:
     return (parsed - datetime.now(APP_TIMEZONE).date()).days
 
 
+def format_local_datetime(value: Any) -> str:
+    if not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(APP_TIMEZONE).strftime("%d/%m/%Y %H:%M")
+
+
+def membership_start_for_user(row: dict[str, Any]) -> date:
+    membership_start = parse_iso_date(row.get("membership_start_date"))
+    if membership_start:
+        return membership_start
+    joined_at = parse_iso_date(row.get("joined_at"))
+    if joined_at:
+        return joined_at
+    return datetime.now(APP_TIMEZONE).date()
+
+
 async def send_long_message(message: Message, text: str) -> None:
     max_length = 3900
     for index in range(0, len(text), max_length):
@@ -182,10 +230,20 @@ def run_schema_migration(supabase: Client) -> None:
     supabase.rpc("exec_sql", {"sql": SCHEMA_MIGRATION_SQL}).execute()
 
 
-def list_dashboard_users(supabase: Client, user_filter: str) -> list[dict[str, Any]]:
+def list_dashboard_users(
+    supabase: Client,
+    user_filter: str,
+    search: str = "",
+    page: int = 1,
+    per_page: int = 25,
+) -> dict[str, Any]:
     query = supabase.table("telegram_users").select("*")
     if user_filter == "active":
         query = query.eq("status", "active")
+    elif user_filter == "confirmed":
+        query = query.eq("confirmed_subscription", True)
+    elif user_filter == "source_confirm_subscription":
+        query = query.eq("source", CONFIRMATION_SOURCE)
     elif user_filter == "expiring_7":
         today = today_iso()
         soon = (datetime.now(APP_TIMEZONE).date() + timedelta(days=7)).isoformat()
@@ -195,11 +253,41 @@ def list_dashboard_users(supabase: Client, user_filter: str) -> list[dict[str, A
     elif user_filter == "no_expiry":
         query = query.is_("expiry_date", "null")
 
-    response = query.order("registered_at", desc=True).limit(500).execute()
+    response = query.order("registered_at", desc=True).limit(2000).execute()
     rows = response.data or []
+    if user_filter == "not_confirmed":
+        rows = [row for row in rows if row.get("confirmed_subscription") is not True]
+    search_term = search.strip().lower()
+    if search_term:
+        rows = [
+            row
+            for row in rows
+            if search_term in str(row.get("telegram_id") or "").lower()
+            or search_term in str(row.get("username") or "").lower()
+            or search_term in str(row.get("first_name") or "").lower()
+            or search_term in str(row.get("last_name") or "").lower()
+        ]
+
     for row in rows:
         row["days_remaining"] = days_remaining(row.get("expiry_date"))
-    return rows
+        row["joined_at_display"] = format_local_datetime(row.get("joined_at"))
+        row["confirmed_at_display"] = format_local_datetime(row.get("confirmed_at"))
+        row["membership_start_date_effective"] = membership_start_for_user(row).isoformat()
+
+    total = len(rows)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    safe_page = min(max(page, 1), total_pages)
+    start = (safe_page - 1) * per_page
+    end = start + per_page
+    return {
+        "rows": rows[start:end],
+        "total": total,
+        "page": safe_page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "has_previous": safe_page > 1,
+        "has_next": safe_page < total_pages,
+    }
 
 
 def renew_user_from_today(supabase: Client, telegram_id: int) -> str:
@@ -210,6 +298,7 @@ def renew_user_from_today(supabase: Client, telegram_id: int) -> str:
             {
                 "expiry_date": expiry,
                 "status": "active",
+                "payment_status": "paid",
                 "last_payment_at": now_utc_iso(),
                 "notes": "Renewed +30 days from today",
             }
@@ -235,6 +324,7 @@ def renew_user_from_current_expiry(supabase: Client, telegram_id: int) -> str:
             {
                 "expiry_date": expiry,
                 "status": "active",
+                "payment_status": "paid",
                 "last_payment_at": now_utc_iso(),
                 "notes": "Renewed +30 days from current expiry_date",
             }
@@ -251,6 +341,7 @@ def mark_user_paid(supabase: Client, telegram_id: int) -> None:
         .update(
             {
                 "status": "active",
+                "payment_status": "paid",
                 "last_payment_at": now_utc_iso(),
                 "notes": "Marked paid from dashboard",
             }
@@ -269,6 +360,25 @@ def mark_user_inactive(supabase: Client, telegram_id: int, notes: str = "Marked 
     )
 
 
+def set_membership_start_date(supabase: Client, telegram_id: int, start_date: str) -> str:
+    parsed = datetime.strptime(start_date, DATE_FORMAT).date()
+    expiry = (parsed + timedelta(days=30)).isoformat()
+    (
+        supabase.table("telegram_users")
+        .update(
+            {
+                "membership_start_date": parsed.isoformat(),
+                "expiry_date": expiry,
+                "status": "active",
+                "notes": "Membership start date set from dashboard",
+            }
+        )
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+    return expiry
+
+
 def update_user_notes(supabase: Client, telegram_id: int, notes: str) -> None:
     (
         supabase.table("telegram_users")
@@ -281,7 +391,38 @@ def update_user_notes(supabase: Client, telegram_id: int, notes: str) -> None:
 def update_user_invite_link(supabase: Client, telegram_id: int, invite_link: str) -> None:
     (
         supabase.table("telegram_users")
-        .update({"invite_link": invite_link, "notes": "Generated one-use invite link from dashboard"})
+        .update(
+            {
+                "invite_link": invite_link,
+                "invite_link_created_at": now_utc_iso(),
+                "notes": "Generated one-use invite link from dashboard",
+            }
+        )
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+
+
+def set_confirmation_status(supabase: Client, telegram_id: int, confirmed: bool) -> None:
+    payload: dict[str, Any] = {
+        "confirmed_subscription": confirmed,
+        "notes": "Marked confirmed manually" if confirmed else "Marked not confirmed manually",
+    }
+    if confirmed:
+        payload.update(
+            {
+                "confirmed_at": now_utc_iso(),
+                "confirmation_campaign": "manual_dashboard",
+                "source": "manual_dashboard",
+                "status": "active",
+            }
+        )
+    else:
+        payload["confirmed_at"] = None
+
+    (
+        supabase.table("telegram_users")
+        .update(payload)
         .eq("telegram_id", telegram_id)
         .execute()
     )
@@ -315,6 +456,19 @@ def build_cta_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def build_confirm_subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=CONFIRM_SUBSCRIPTION_BUTTON_TEXT,
+                    callback_data=CONFIRM_SUBSCRIPTION_CALLBACK_DATA,
+                )
+            ]
+        ]
+    )
+
+
 def upsert_cta_user(supabase: Client, callback_query: CallbackQuery) -> None:
     if not callback_query.from_user:
         raise ValueError("Callback query has no from_user")
@@ -322,21 +476,25 @@ def upsert_cta_user(supabase: Client, callback_query: CallbackQuery) -> None:
     user = callback_query.from_user
     existing = get_registered_user(supabase, user.id)
     joined_at = now_utc_iso()
-    expiry_date = (datetime.now(APP_TIMEZONE).date() + timedelta(days=30)).isoformat()
+    membership_start_date = datetime.now(APP_TIMEZONE).date()
+    expiry_date = (membership_start_date + timedelta(days=30)).isoformat()
     payload = {
         "telegram_id": user.id,
         "username": user.username,
         "first_name": user.first_name,
         "last_name": user.last_name,
         "status": "active",
+        "payment_status": "unpaid",
         "notes": CTA_NOTES,
     }
 
     if existing:
         if not existing.get("joined_at"):
             payload["joined_at"] = joined_at
+        if not existing.get("membership_start_date"):
+            payload["membership_start_date"] = membership_start_for_user(existing).isoformat()
         if not existing.get("expiry_date"):
-            payload["expiry_date"] = expiry_date
+            payload["expiry_date"] = (membership_start_for_user({**existing, **payload}) + timedelta(days=30)).isoformat()
         (
             supabase.table("telegram_users")
             .update(payload)
@@ -348,9 +506,56 @@ def upsert_cta_user(supabase: Client, callback_query: CallbackQuery) -> None:
 
     payload["registered_at"] = joined_at
     payload["joined_at"] = joined_at
+    payload["membership_start_date"] = membership_start_date.isoformat()
     payload["expiry_date"] = expiry_date
     supabase.table("telegram_users").insert(payload).execute()
     logger.info("Registered CTA user telegram_id=%s", user.id)
+
+
+def upsert_confirmed_subscription_user(supabase: Client, callback_query: CallbackQuery) -> None:
+    if not callback_query.from_user:
+        raise ValueError("Callback query has no from_user")
+
+    user = callback_query.from_user
+    existing = get_registered_user(supabase, user.id)
+    now = now_utc_iso()
+    membership_start_date = datetime.now(APP_TIMEZONE).date()
+    payload: dict[str, Any] = {
+        "telegram_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "status": "active",
+        "confirmed_subscription": True,
+        "confirmed_at": now,
+        "confirmation_campaign": CONFIRMATION_CAMPAIGN,
+        "source": CONFIRMATION_SOURCE,
+    }
+
+    if existing:
+        if not existing.get("joined_at"):
+            payload["joined_at"] = now
+        if not existing.get("registered_at"):
+            payload["registered_at"] = now
+        if not existing.get("membership_start_date"):
+            payload["membership_start_date"] = membership_start_date.isoformat()
+        if not existing.get("expiry_date"):
+            payload["expiry_date"] = (membership_start_date + timedelta(days=30)).isoformat()
+        (
+            supabase.table("telegram_users")
+            .update(payload)
+            .eq("telegram_id", user.id)
+            .execute()
+        )
+        logger.info("Confirmed subscription for telegram_id=%s", user.id)
+        return
+
+    payload["registered_at"] = now
+    payload["joined_at"] = now
+    payload["membership_start_date"] = membership_start_date.isoformat()
+    payload["expiry_date"] = (membership_start_date + timedelta(days=30)).isoformat()
+    supabase.table("telegram_users").insert(payload).execute()
+    logger.info("Registered confirmed subscription user telegram_id=%s", user.id)
 
 
 @router.message(Command("send_poll"))
@@ -371,6 +576,26 @@ async def send_poll(message: Message, settings: Settings) -> None:
         return
 
     await message.answer("Mensaje enviado al canal.")
+
+
+@router.message(Command("send_confirm_subscription"))
+async def send_confirm_subscription(message: Message, settings: Settings) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        await message.bot.send_message(
+            chat_id=settings.content_channel_id,
+            text=CONFIRM_SUBSCRIPTION_MESSAGE,
+            reply_markup=build_confirm_subscription_keyboard(),
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        logger.exception("Could not send subscription confirmation message")
+        await message.answer(f"No pude enviar el mensaje de confirmación: {exc}")
+        return
+
+    await message.answer("Mensaje de confirmación enviado al canal.")
 
 
 @router.message(Command("users"))
@@ -403,6 +628,35 @@ async def users(message: Message, settings: Settings, supabase: Client) -> None:
     lines.extend(format_user(row) for row in latest)
     if not latest:
         lines.append("Sin usuarios registrados todavía.")
+    await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("unconfirmed"))
+async def unconfirmed(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        response = (
+            supabase.table("telegram_users")
+            .select("*")
+            .order("registered_at", desc=True)
+            .limit(500)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("Could not fetch unconfirmed users")
+        await message.answer(f"No pude consultar no confirmados: {exc}")
+        return
+
+    rows = [row for row in (response.data or []) if row.get("confirmed_subscription") is not True]
+    lines = [f"Usuarios sin confirmación: {len(rows)}"]
+    lines.extend(format_user(row) for row in rows[:50])
+    if len(rows) > 50:
+        lines.append(f"...y {len(rows) - 50} más.")
+    if not rows:
+        lines.append("Todos los usuarios están confirmados.")
     await send_long_message(message, "\n".join(lines))
 
 
@@ -502,6 +756,17 @@ async def want_more_content(callback_query: CallbackQuery, supabase: Client) -> 
         await callback_query.answer("Intenta de nuevo.", show_alert=False)
 
 
+@router.callback_query(F.data == CONFIRM_SUBSCRIPTION_CALLBACK_DATA)
+async def confirm_subscription(callback_query: CallbackQuery, supabase: Client) -> None:
+    try:
+        upsert_confirmed_subscription_user(supabase, callback_query)
+        await callback_query.answer("Suscripción confirmada ✅")
+    except Exception:
+        user_id = callback_query.from_user.id if callback_query.from_user else "unknown"
+        logger.exception("Could not process subscription confirmation for user_id=%s", user_id)
+        await callback_query.answer("Intenta de nuevo.", show_alert=False)
+
+
 @router.error()
 async def handle_error(event: ErrorEvent) -> None:
     logger.exception("Unhandled update error: %s", event.exception)
@@ -560,11 +825,15 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
 
 def dashboard_redirect(
     user_filter: str = "all",
+    search: str = "",
+    page: int = 1,
     message: str | None = None,
     error: str | None = None,
     invite_link: str | None = None,
 ) -> RedirectResponse:
-    params = {"filter": user_filter}
+    params: dict[str, Any] = {"filter": user_filter, "page": page}
+    if search:
+        params["search"] = search
     if message:
         params["message"] = message
     if error:
@@ -626,6 +895,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     async def dashboard(
         request: Request,
         filter: str = "all",
+        search: str = "",
+        page: int = 1,
         message: str | None = None,
         error: str | None = None,
         invite_link: str | None = None,
@@ -633,12 +904,34 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
 
-        safe_filter = filter if filter in {"all", "active", "expiring_7", "expired", "no_expiry"} else "all"
+        safe_filter = (
+            filter
+            if filter
+            in {
+                "all",
+                "active",
+                "confirmed",
+                "not_confirmed",
+                "source_confirm_subscription",
+                "expiring_7",
+                "expired",
+                "no_expiry",
+            }
+            else "all"
+        )
         try:
-            rows = await asyncio.to_thread(list_dashboard_users, supabase, safe_filter)
+            page_data = await asyncio.to_thread(list_dashboard_users, supabase, safe_filter, search, page)
         except Exception as exc:
             logger.exception("Could not load dashboard users")
-            rows = []
+            page_data = {
+                "rows": [],
+                "total": 0,
+                "page": 1,
+                "per_page": 25,
+                "total_pages": 1,
+                "has_previous": False,
+                "has_next": False,
+            }
             error = f"Could not load users: {exc}"
 
         return templates.TemplateResponse(
@@ -646,8 +939,15 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             "dashboard.html",
             {
                 "request": request,
-                "users": rows,
+                "users": page_data["rows"],
                 "active_filter": safe_filter,
+                "search": search,
+                "page": page_data["page"],
+                "per_page": page_data["per_page"],
+                "total_users": page_data["total"],
+                "total_pages": page_data["total_pages"],
+                "has_previous": page_data["has_previous"],
+                "has_next": page_data["has_next"],
                 "message": message,
                 "error": error,
                 "invite_link": invite_link,
@@ -656,21 +956,34 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         )
 
     @app.post("/dashboard/users/{telegram_id}/renew/today", response_model=None)
-    async def dashboard_renew_today(telegram_id: int, request: Request, filter: str = "all"):
+    async def dashboard_renew_today(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
             expiry = await asyncio.to_thread(renew_user_from_today, supabase, telegram_id)
-            return dashboard_redirect(filter, message=f"Renewed from today. New expiry: {expiry} for {telegram_id}.")
+            return dashboard_redirect(
+                filter,
+                search,
+                page,
+                message=f"Renewed from today. New expiry: {expiry} for {telegram_id}.",
+            )
         except Exception as exc:
             logger.exception("Could not renew from today for telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not renew user: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not renew user: {exc}")
 
     @app.post("/dashboard/users/{telegram_id}/renew/current-expiry", response_model=None)
     async def dashboard_renew_current_expiry(
         telegram_id: int,
         request: Request,
         filter: str = "all",
+        search: str = "",
+        page: int = 1,
     ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
@@ -678,36 +991,118 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             expiry = await asyncio.to_thread(renew_user_from_current_expiry, supabase, telegram_id)
             return dashboard_redirect(
                 filter,
+                search,
+                page,
                 message=f"Renewed from current expiry_date. New expiry: {expiry} for {telegram_id}.",
             )
         except Exception as exc:
             logger.exception("Could not renew from current expiry for telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not renew from current expiry_date: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not renew from current expiry_date: {exc}")
 
     @app.post("/dashboard/users/{telegram_id}/paid", response_model=None)
-    async def dashboard_mark_paid(telegram_id: int, request: Request, filter: str = "all"):
+    async def dashboard_mark_paid(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
             await asyncio.to_thread(mark_user_paid, supabase, telegram_id)
-            return dashboard_redirect(filter, message=f"User {telegram_id} marked paid.")
+            return dashboard_redirect(filter, search, page, message=f"User {telegram_id} marked paid.")
         except Exception as exc:
             logger.exception("Could not mark paid telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not mark paid: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not mark paid: {exc}")
+
+    @app.post("/dashboard/users/{telegram_id}/membership-start", response_model=None)
+    async def dashboard_set_membership_start(
+        telegram_id: int,
+        request: Request,
+        membership_start_date: str = Form(...),
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        try:
+            expiry = await asyncio.to_thread(
+                set_membership_start_date,
+                supabase,
+                telegram_id,
+                membership_start_date,
+            )
+            return dashboard_redirect(
+                filter,
+                search,
+                page,
+                message=f"Membership start updated. New expiry: {expiry} for {telegram_id}.",
+            )
+        except Exception as exc:
+            logger.exception("Could not set membership start for telegram_id=%s", telegram_id)
+            return dashboard_redirect(filter, search, page, error=f"Could not set membership start date: {exc}")
+
+    @app.post("/dashboard/users/{telegram_id}/confirmed", response_model=None)
+    async def dashboard_mark_confirmed(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        try:
+            await asyncio.to_thread(set_confirmation_status, supabase, telegram_id, True)
+            return dashboard_redirect(filter, search, page, message=f"User {telegram_id} marked confirmed.")
+        except Exception as exc:
+            logger.exception("Could not mark confirmed telegram_id=%s", telegram_id)
+            return dashboard_redirect(filter, search, page, error=f"Could not mark confirmed: {exc}")
+
+    @app.post("/dashboard/users/{telegram_id}/not-confirmed", response_model=None)
+    async def dashboard_mark_not_confirmed(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        try:
+            await asyncio.to_thread(set_confirmation_status, supabase, telegram_id, False)
+            return dashboard_redirect(filter, search, page, message=f"User {telegram_id} marked not confirmed.")
+        except Exception as exc:
+            logger.exception("Could not mark not confirmed telegram_id=%s", telegram_id)
+            return dashboard_redirect(filter, search, page, error=f"Could not mark not confirmed: {exc}")
 
     @app.post("/dashboard/users/{telegram_id}/inactive", response_model=None)
-    async def dashboard_mark_inactive(telegram_id: int, request: Request, filter: str = "all"):
+    async def dashboard_mark_inactive(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
             await asyncio.to_thread(mark_user_inactive, supabase, telegram_id)
-            return dashboard_redirect(filter, message=f"User {telegram_id} marked inactive.")
+            return dashboard_redirect(filter, search, page, message=f"User {telegram_id} marked inactive.")
         except Exception as exc:
             logger.exception("Could not mark inactive telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not mark inactive: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not mark inactive: {exc}")
 
     @app.post("/dashboard/users/{telegram_id}/invite", response_model=None)
-    async def dashboard_invite(telegram_id: int, request: Request, filter: str = "all"):
+    async def dashboard_invite(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
@@ -719,28 +1114,32 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             await asyncio.to_thread(update_user_invite_link, supabase, telegram_id, invite.invite_link)
             return dashboard_redirect(
                 filter,
+                search,
+                page,
                 message=f"One-use invite link generated for {telegram_id}.",
                 invite_link=invite.invite_link,
             )
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             logger.exception("Could not create invite link for telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not create invite link: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not create invite link: {exc}")
         except Exception as exc:
             logger.exception("Unexpected invite link error for telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not create invite link: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not create invite link: {exc}")
 
     @app.get("/dashboard/users/{telegram_id}/remove", response_class=HTMLResponse, response_model=None)
     async def dashboard_remove_confirm(
         telegram_id: int,
         request: Request,
         filter: str = "all",
+        search: str = "",
+        page: int = 1,
     ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
             user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
             if not user:
-                return dashboard_redirect(filter, error=f"User {telegram_id} not found.")
+                return dashboard_redirect(filter, search, page, error=f"User {telegram_id} not found.")
             return templates.TemplateResponse(
                 request,
                 "confirm_remove.html",
@@ -748,14 +1147,22 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
                     "request": request,
                     "user": user,
                     "active_filter": filter,
+                    "search": search,
+                    "page": page,
                 },
             )
         except Exception as exc:
             logger.exception("Could not load remove confirmation for telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not load confirmation: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not load confirmation: {exc}")
 
     @app.post("/dashboard/users/{telegram_id}/remove/confirm", response_model=None)
-    async def dashboard_remove_confirmed(telegram_id: int, request: Request, filter: str = "all"):
+    async def dashboard_remove_confirmed(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
@@ -766,13 +1173,13 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
                 only_if_banned=True,
             )
             await asyncio.to_thread(mark_user_removed, supabase, telegram_id)
-            return dashboard_redirect(filter, message=f"User {telegram_id} removed from channel.")
+            return dashboard_redirect(filter, search, page, message=f"User {telegram_id} removed from channel.")
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             logger.exception("Could not remove telegram_id=%s from channel", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not remove user from channel: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not remove user from channel: {exc}")
         except Exception as exc:
             logger.exception("Unexpected remove error for telegram_id=%s", telegram_id)
-            return dashboard_redirect(filter, error=f"Could not remove user from channel: {exc}")
+            return dashboard_redirect(filter, search, page, error=f"Could not remove user from channel: {exc}")
 
     return app
 
