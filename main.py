@@ -97,6 +97,31 @@ where expiry_date is null and membership_start_date is null and joined_at is not
 update public.telegram_users
 set expiry_date = membership_start_date + 30
 where expiry_date is null and membership_start_date is not null;
+create table if not exists public.payment_history (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  username text,
+  first_name text,
+  admin_id bigint,
+  action text default 'approved',
+  payment_status text default 'paid',
+  receipt_file_id text,
+  invite_link text,
+  membership_start_date date,
+  expiry_date date,
+  notes text,
+  created_at timestamptz default now()
+);
+alter table public.payment_history add column if not exists membership_start_date date;
+alter table public.payment_history add column if not exists expiry_date date;
+alter table public.payment_history alter column action set default 'approved';
+alter table public.payment_history alter column payment_status set default 'paid';
+create index if not exists payment_history_telegram_id_idx
+  on public.payment_history (telegram_id);
+create index if not exists payment_history_created_at_idx
+  on public.payment_history (created_at desc);
+create index if not exists payment_history_payment_status_idx
+  on public.payment_history (payment_status);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -288,6 +313,22 @@ def format_user_record(row: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_payment_history_rows(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "Sin historial de pagos."
+    lines: list[str] = []
+    for row in rows:
+        created_at = row.get("created_at_display") or format_local_datetime(row.get("created_at"))
+        lines.append(
+            f"{created_at} | {row.get('action') or '-'} | "
+            f"{row.get('payment_status') or '-'} | admin: {row.get('admin_id') or '-'} | "
+            f"start: {row.get('membership_start_date') or '-'} | "
+            f"expiry: {row.get('expiry_date') or '-'} | "
+            f"notes: {row.get('notes') or '-'}"
+        )
+    return "\n".join(lines)
+
+
 def get_registered_user(supabase: Client, telegram_id: int) -> dict[str, Any] | None:
     response = (
         supabase.table("telegram_users")
@@ -309,6 +350,74 @@ def get_user_by_invite_link_name(supabase: Client, invite_link_name: str) -> dic
         .execute()
     )
     return response.data[0] if response.data else None
+
+
+def insert_payment_history(
+    supabase: Client,
+    telegram_id: int,
+    action: str,
+    payment_status: str | None = None,
+    admin_id: int | None = None,
+    receipt_file_id: str | None = None,
+    invite_link: str | None = None,
+    membership_start_date: str | None = None,
+    expiry_date: str | None = None,
+    notes: str | None = None,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> None:
+    try:
+        payload = {
+            "telegram_id": telegram_id,
+            "username": username,
+            "first_name": first_name,
+            "payment_status": payment_status,
+            "admin_id": admin_id,
+            "action": action,
+            "receipt_file_id": receipt_file_id,
+            "invite_link": invite_link,
+            "membership_start_date": membership_start_date,
+            "expiry_date": expiry_date,
+            "notes": notes,
+        }
+        supabase.table("payment_history").insert(payload).execute()
+    except Exception:
+        logger.warning(
+            "Could not insert payment history action=%s telegram_id=%s",
+            action,
+            telegram_id,
+            exc_info=True,
+        )
+
+
+def get_payment_history(supabase: Client, telegram_id: int, limit: int | None = 10) -> list[dict[str, Any]]:
+    query = (
+        supabase.table("payment_history")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .eq("action", "approved")
+        .eq("payment_status", "paid")
+        .order("created_at", desc=True)
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    response = query.execute()
+    rows = response.data or []
+    for row in rows:
+        row["created_at_display"] = format_local_datetime(row.get("created_at"))
+    return rows
+
+
+def payment_history_telegram_ids(supabase: Client) -> set[int]:
+    response = (
+        supabase.table("payment_history")
+        .select("telegram_id")
+        .eq("action", "approved")
+        .eq("payment_status", "paid")
+        .limit(5000)
+        .execute()
+    )
+    return {int(row["telegram_id"]) for row in (response.data or []) if row.get("telegram_id") is not None}
 
 
 def upsert_user_payload(supabase: Client, telegram_id: int, payload: dict[str, Any]) -> None:
@@ -368,6 +477,13 @@ def list_dashboard_users(
     rows = response.data or []
     if user_filter == "not_confirmed":
         rows = [row for row in rows if row.get("confirmed_subscription") is not True]
+    elif user_filter == "has_payment_history":
+        try:
+            ids_with_history = payment_history_telegram_ids(supabase)
+            rows = [row for row in rows if int(row.get("telegram_id")) in ids_with_history]
+        except Exception:
+            logger.warning("Could not apply has_payment_history dashboard filter", exc_info=True)
+            rows = []
     search_term = search.strip().lower()
     if search_term:
         rows = [
@@ -392,8 +508,15 @@ def list_dashboard_users(
     safe_page = min(max(page, 1), total_pages)
     start = (safe_page - 1) * per_page
     end = start + per_page
+    page_rows = rows[start:end]
+    for row in page_rows:
+        try:
+            row["recent_payment_history"] = get_payment_history(supabase, int(row["telegram_id"]), limit=5)
+        except Exception:
+            logger.warning("Could not load recent payment history telegram_id=%s", row.get("telegram_id"), exc_info=True)
+            row["recent_payment_history"] = []
     return {
-        "rows": rows[start:end],
+        "rows": page_rows,
         "total": total,
         "page": safe_page,
         "per_page": per_page,
@@ -544,8 +667,9 @@ async def revoke_invite_for_user(
     user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
     if not user or not user.get("invite_link") or user.get("invite_link_revoked") is True:
         return False
+    revoked_link = user["invite_link"]
     try:
-        await bot.revoke_chat_invite_link(settings.content_channel_id, user["invite_link"])
+        await bot.revoke_chat_invite_link(settings.content_channel_id, revoked_link)
         logger.info("Revoked previous invite link telegram_id=%s", telegram_id)
     except TelegramBadRequest:
         logger.warning("Could not revoke previous invite link telegram_id=%s", telegram_id, exc_info=True)
@@ -667,6 +791,21 @@ async def approve_payment(
         telegram_id,
         approval_payload,
     )
+    await asyncio.to_thread(
+        insert_payment_history,
+        supabase,
+        telegram_id,
+        "approved",
+        "paid",
+        admin_id,
+        None,
+        invite_link,
+        today.isoformat(),
+        expiry.isoformat(),
+        "Payment approved by admin",
+        existing_user.get("username") if existing_user else None,
+        existing_user.get("first_name") if existing_user else None,
+    )
     dm_sent = await send_invite_to_user(bot, telegram_id, invite_link)
     if dm_sent:
         await bot.send_message(settings.admin_chat_id, f"Pago aprobado y link enviado a {telegram_id}")
@@ -679,7 +818,13 @@ async def approve_payment(
     return {"invite_link": invite_link, "duplicate": False, "reused": reused_invite}
 
 
-async def reject_payment(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> None:
+async def reject_payment(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+    admin_id: int | None = None,
+) -> None:
     await asyncio.to_thread(
         upsert_user_payload,
         supabase,
@@ -702,7 +847,13 @@ async def reject_payment(bot: Bot, supabase: Client, settings: Settings, telegra
     logger.info("Payment rejected telegram_id=%s", telegram_id)
 
 
-async def ask_new_receipt(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> None:
+async def ask_new_receipt(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+    admin_id: int | None = None,
+) -> None:
     await asyncio.to_thread(
         upsert_user_payload,
         supabase,
@@ -1193,6 +1344,24 @@ async def user_record(message: Message, settings: Settings, supabase: Client) ->
     await send_long_message(message, format_user_record(row or {}))
 
 
+@router.message(Command("payment_history"))
+async def payment_history_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /payment_history <telegram_id>")
+        return
+    try:
+        rows = await asyncio.to_thread(get_payment_history, supabase, telegram_id, 10)
+    except Exception as exc:
+        logger.exception("Could not fetch payment history telegram_id=%s", telegram_id)
+        await message.answer(f"No pude consultar historial de pagos: {exc}")
+        return
+    await send_long_message(message, f"Historial de pagos para {telegram_id}:\n{format_payment_history_rows(rows)}")
+
+
 @router.message(Command("send_invite"))
 async def send_invite(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -1326,7 +1495,7 @@ async def reject_command(message: Message, settings: Settings, supabase: Client)
     if telegram_id is None:
         await message.answer("Uso: /reject <telegram_id>")
         return
-    await reject_payment(message.bot, supabase, settings, telegram_id)
+    await reject_payment(message.bot, supabase, settings, telegram_id, message.from_user.id if message.from_user else None)
     await message.answer(f"Pago rechazado para {telegram_id}.")
 
 
@@ -1339,7 +1508,7 @@ async def ask_receipt_command(message: Message, settings: Settings, supabase: Cl
     if telegram_id is None:
         await message.answer("Uso: /ask_receipt <telegram_id>")
         return
-    await ask_new_receipt(message.bot, supabase, settings, telegram_id)
+    await ask_new_receipt(message.bot, supabase, settings, telegram_id, message.from_user.id if message.from_user else None)
     await message.answer(f"Se pidió otra captura a {telegram_id}.")
 
 
@@ -1501,10 +1670,10 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             else:
                 await callback_query.answer("Aprobado ✅")
         elif action == "reject":
-            await reject_payment(callback_query.bot, supabase, settings, telegram_id)
+            await reject_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
             await callback_query.answer("Rechazado ❌")
         elif action == "ask_receipt":
-            await ask_new_receipt(callback_query.bot, supabase, settings, telegram_id)
+            await ask_new_receipt(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
             await callback_query.answer("Solicitud enviada 🔁")
         else:
             await callback_query.answer("Acción inválida.", show_alert=True)
@@ -1761,6 +1930,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
                 "expiring_7",
                 "expired",
                 "no_expiry",
+                "has_payment_history",
             }
             else "all"
         )
@@ -1918,7 +2088,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
-        await reject_payment(bot, supabase, settings, telegram_id)
+        await reject_payment(bot, supabase, settings, telegram_id, next(iter(settings.admin_user_ids)))
         return dashboard_redirect(filter, search, page, message=f"Payment rejected for {telegram_id}.")
 
     @app.post("/dashboard/users/{telegram_id}/ask-receipt", response_model=None)
@@ -1931,7 +2101,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
-        await ask_new_receipt(bot, supabase, settings, telegram_id)
+        await ask_new_receipt(bot, supabase, settings, telegram_id, next(iter(settings.admin_user_ids)))
         return dashboard_redirect(filter, search, page, message=f"Requested another receipt from {telegram_id}.")
 
     @app.post("/dashboard/users/{telegram_id}/confirmed", response_model=None)
@@ -2053,6 +2223,35 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         except Exception as exc:
             logger.exception("Dashboard send invite failed telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, search, page, error=f"Could not send invite: {exc}")
+
+    @app.get("/dashboard/users/{telegram_id}/history", response_class=HTMLResponse, response_model=None)
+    async def dashboard_payment_history(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        try:
+            user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+            rows = await asyncio.to_thread(get_payment_history, supabase, telegram_id, None)
+            return templates.TemplateResponse(
+                request,
+                "payment_history.html",
+                {
+                    "request": request,
+                    "user": user or {"telegram_id": telegram_id},
+                    "history": rows,
+                    "active_filter": filter,
+                    "search": search,
+                    "page": page,
+                },
+            )
+        except Exception as exc:
+            logger.exception("Could not load payment history telegram_id=%s", telegram_id)
+            return dashboard_redirect(filter, search, page, error=f"Could not load payment history: {exc}")
 
     @app.get("/dashboard/users/{telegram_id}/remove", response_class=HTMLResponse, response_model=None)
     async def dashboard_remove_confirm(
