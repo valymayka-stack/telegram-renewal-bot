@@ -91,10 +91,10 @@
         <dd>{{ user.status or "-" }}</dd>
       </dl>
       <div class="actions">
-        <form method="post" action="/dashboard/users/{{ user.telegram_id }}/remove/confirm?filter={{ active_filter }}">
+        <form method="post" action="/dashboard/users/{{ user.telegram_id }}/remove/confirm?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
           <button type="submit">Confirm Remove</button>
         </form>
-        <a href="/dashboard?filter={{ active_filter }}">Cancel</a>
+        <a href="/dashboard?filter={{ active_filter }}&search={{ search }}&page={{ page }}">Cancel</a>
       </div>
     </main>
   </body>
