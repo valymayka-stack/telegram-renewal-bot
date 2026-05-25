@@ -601,7 +601,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     async def login_page(request: Request):
         if is_logged_in(request):
             return RedirectResponse(url="/dashboard", status_code=303)
-        return templates.TemplateResponse("login.html", {"request": request, "error": None})
+        return templates.TemplateResponse(request, "login.html", {"request": request, "error": None})
 
     @app.post("/login", response_model=None)
     async def login(request: Request, password: str = Form(...)):
@@ -611,6 +611,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
 
         logger.warning("Failed dashboard login")
         return templates.TemplateResponse(
+            request,
             "login.html",
             {"request": request, "error": "Invalid password"},
             status_code=401,
@@ -641,6 +642,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             error = f"Could not load users: {exc}"
 
         return templates.TemplateResponse(
+            request,
             "dashboard.html",
             {
                 "request": request,
@@ -740,6 +742,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             if not user:
                 return dashboard_redirect(filter, error=f"User {telegram_id} not found.")
             return templates.TemplateResponse(
+                request,
                 "confirm_remove.html",
                 {
                     "request": request,
