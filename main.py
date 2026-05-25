@@ -597,14 +597,14 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             return RedirectResponse(url="/dashboard", status_code=303)
         return RedirectResponse(url="/login", status_code=303)
 
-    @app.get("/login", response_class=HTMLResponse)
-    async def login_page(request: Request) -> HTMLResponse:
+    @app.get("/login", response_class=HTMLResponse, response_model=None)
+    async def login_page(request: Request):
         if is_logged_in(request):
             return RedirectResponse(url="/dashboard", status_code=303)
         return templates.TemplateResponse("login.html", {"request": request, "error": None})
 
     @app.post("/login")
-    async def login(request: Request, password: str = Form(...)) -> RedirectResponse | HTMLResponse:
+    async def login(request: Request, password: str = Form(...)):
         if secrets.compare_digest(password, settings.admin_password):
             request.session["admin_authenticated"] = True
             return RedirectResponse(url="/dashboard?message=Login%20successful", status_code=303)
@@ -621,14 +621,14 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         request.session.clear()
         return RedirectResponse(url="/login", status_code=303)
 
-    @app.get("/dashboard", response_class=HTMLResponse)
+    @app.get("/dashboard", response_class=HTMLResponse, response_model=None)
     async def dashboard(
         request: Request,
         filter: str = "all",
         message: str | None = None,
         error: str | None = None,
         invite_link: str | None = None,
-    ) -> HTMLResponse | RedirectResponse:
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
 
@@ -732,7 +732,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         telegram_id: int,
         request: Request,
         filter: str = "all",
-    ) -> HTMLResponse | RedirectResponse:
+    ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
