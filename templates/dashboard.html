@@ -109,6 +109,11 @@
         color: #1d3f87;
         overflow-wrap: anywhere;
       }
+      .invite-cell {
+        display: inline-block;
+        max-width: 220px;
+        overflow-wrap: anywhere;
+      }
       .table-wrap {
         overflow-x: auto;
         background: #ffffff;
@@ -233,6 +238,10 @@
         <div class="toolbar-left">
           <nav class="filters" aria-label="User filters">
             <a class="filter {% if active_filter == 'all' %}active{% endif %}" href="/dashboard?filter=all&search={{ search }}">All</a>
+            <a class="filter {% if active_filter == 'pending_payments' %}active{% endif %}" href="/dashboard?filter=pending_payments&search={{ search }}">Pending payments</a>
+            <a class="filter {% if active_filter == 'paid' %}active{% endif %}" href="/dashboard?filter=paid&search={{ search }}">Paid</a>
+            <a class="filter {% if active_filter == 'needs_new_receipt' %}active{% endif %}" href="/dashboard?filter=needs_new_receipt&search={{ search }}">Needs new receipt</a>
+            <a class="filter {% if active_filter == 'rejected' %}active{% endif %}" href="/dashboard?filter=rejected&search={{ search }}">Rejected</a>
             <a class="filter {% if active_filter == 'active' %}active{% endif %}" href="/dashboard?filter=active&search={{ search }}">Active</a>
             <a class="filter {% if active_filter == 'confirmed' %}active{% endif %}" href="/dashboard?filter=confirmed&search={{ search }}">Confirmed</a>
             <a class="filter {% if active_filter == 'not_confirmed' %}active{% endif %}" href="/dashboard?filter=not_confirmed&search={{ search }}">Not confirmed</a>
@@ -240,6 +249,7 @@
             <a class="filter {% if active_filter == 'expiring_7' %}active{% endif %}" href="/dashboard?filter=expiring_7&search={{ search }}">Expiring in 7 days</a>
             <a class="filter {% if active_filter == 'expired' %}active{% endif %}" href="/dashboard?filter=expired&search={{ search }}">Expired</a>
             <a class="filter {% if active_filter == 'no_expiry' %}active{% endif %}" href="/dashboard?filter=no_expiry&search={{ search }}">No expiry date</a>
+            <a class="filter {% if active_filter == 'removed_inactive' %}active{% endif %}" href="/dashboard?filter=removed_inactive&search={{ search }}">Removed/inactive</a>
           </nav>
           <form class="search" method="get" action="/dashboard">
             <input type="hidden" name="filter" value="{{ active_filter }}">
@@ -269,6 +279,7 @@
                 <th>Telegram ID</th>
                 <th>Username</th>
                 <th>First Name</th>
+                <th>Payment</th>
                 <th>Status</th>
                 <th>Confirmed</th>
                 <th>Confirmed At</th>
@@ -277,6 +288,9 @@
                 <th>Membership Start</th>
                 <th>Expiry Date</th>
                 <th>Days Remaining</th>
+                <th>Joined Channel</th>
+                <th>Left Channel</th>
+                <th>Invite Link</th>
                 <th>Notes</th>
                 <th>Actions</th>
               </tr>
@@ -290,6 +304,7 @@
                   </td>
                   <td>{% if user.username %}@{{ user.username }}{% else %}-{% endif %}</td>
                   <td>{{ user.first_name or "-" }}</td>
+                  <td>{{ user.payment_status or "-" }}</td>
                   <td>{{ user.status or "-" }}</td>
                   <td>{% if user.confirmed_subscription %}Yes{% else %}No{% endif %}</td>
                   <td>{{ user.confirmed_at_display or "-" }}</td>
@@ -298,12 +313,24 @@
                   <td>{{ user.membership_start_date_effective or "-" }}</td>
                   <td>{{ user.expiry_date or "-" }}</td>
                   <td>{% if user.days_remaining is not none %}{{ user.days_remaining }}{% else %}-{% endif %}</td>
+                  <td>{{ user.joined_channel_at_display or "-" }}</td>
+                  <td>{{ user.left_channel_at_display or "-" }}</td>
+                  <td>{% if user.invite_link %}<span class="invite-cell">{{ user.invite_link }}</span>{% else %}-{% endif %}</td>
                   <td>{{ user.notes or "-" }}</td>
                   <td>
                     <div class="actions">
                       <form class="date-action" method="post" action="/dashboard/users/{{ user.telegram_id }}/membership-start?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
                         <input class="date-input" name="membership_start_date" type="date" value="{{ user.membership_start_date_effective or '' }}" required>
                         <button class="action" type="submit">Set membership start date</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/approve-payment?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
+                        <button class="action primary" type="submit">Approve pending payment</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/reject-payment?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
+                        <button class="action" type="submit">Reject payment</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/ask-receipt?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
+                        <button class="action" type="submit">Ask for another receipt</button>
                       </form>
                       <form method="post" action="/dashboard/users/{{ user.telegram_id }}/renew/today?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
                         <button class="action primary" type="submit">Renew +30 from today</button>
@@ -325,6 +352,9 @@
                       </form>
                       <form method="post" action="/dashboard/users/{{ user.telegram_id }}/invite?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
                         <button class="action" type="submit">Generate invite link</button>
+                      </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/send-existing-invite?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
+                        <button class="action" type="submit">Send existing invite link</button>
                       </form>
                       <a class="action danger" href="/dashboard/users/{{ user.telegram_id }}/remove?filter={{ active_filter }}&search={{ search }}&page={{ page }}">Remove from channel</a>
                     </div>
