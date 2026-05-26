@@ -250,6 +250,19 @@
         color: #526074;
         font-size: 12px;
       }
+      .receipt-thumb {
+        display: block;
+        width: 96px;
+        height: 96px;
+        object-fit: cover;
+        border: 1px solid #dfe5ef;
+        border-radius: 6px;
+        margin-top: 8px;
+      }
+      .history-link {
+        display: inline-flex;
+        margin-top: 8px;
+      }
       .date-action {
         display: grid;
         gap: 6px;
@@ -305,6 +318,7 @@
       <div class="toolbar">
         <div class="toolbar-left">
           <nav class="filters" aria-label="User filters">
+            <a class="filter" href="/dashboard/payments">Approved payments</a>
             <a class="filter {% if active_filter == 'all' %}active{% endif %}" href="/dashboard?filter=all&search={{ search }}">All</a>
             <a class="filter {% if active_filter == 'pending_payments' %}active{% endif %}" href="/dashboard?filter=pending_payments&search={{ search }}">Pending payments</a>
             <a class="filter {% if active_filter == 'paid' %}active{% endif %}" href="/dashboard?filter=paid&search={{ search }}">Paid</a>
@@ -458,6 +472,12 @@
                                 status: {{ record.payment_status or "-" }} · admin: {{ record.admin_id or "-" }} ·
                                 {{ record.membership_start_date or "-" }} to {{ record.expiry_date or "-" }}
                               </div>
+                              {% if record.receipt_file_url %}
+                                {% if record.receipt_file_type == "photo" %}
+                                  <img class="receipt-thumb" src="{{ record.receipt_file_url }}" alt="Payment receipt preview">
+                                {% endif %}
+                                <a class="filter history-link" href="{{ record.receipt_file_url }}" target="_blank" rel="noopener">Open screenshot</a>
+                              {% endif %}
                               <div>{{ record.notes or "-" }}</div>
                             </div>
                           {% endfor %}
