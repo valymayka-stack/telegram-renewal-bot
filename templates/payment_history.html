@@ -70,47 +70,116 @@
         display: inline-flex;
         margin-top: 8px;
       }
+      .toolbar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 16px;
+      }
+      .toolbar input {
+        min-height: 34px;
+        border: 1px solid #becada;
+        border-radius: 6px;
+        padding: 0 10px;
+        font: inherit;
+        font-size: 14px;
+        width: min(360px, 100%);
+      }
+      .button,
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        border-radius: 6px;
+        border: 1px solid #becada;
+        background: #ffffff;
+        color: #1f2b3d;
+        padding: 0 10px;
+        text-decoration: none;
+        font: inherit;
+        font-size: 14px;
+      }
+      .badge {
+        min-height: 24px;
+        border-color: #abd8c5;
+        background: #e8f5f0;
+        color: #0f513f;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .receipt-thumb {
+        display: block;
+        width: 92px;
+        height: 92px;
+        object-fit: cover;
+        border: 1px solid #dfe5ef;
+        border-radius: 6px;
+        margin-bottom: 8px;
+      }
     </style>
   </head>
   <body>
     <header>
       <h1>Approved Payment History</h1>
-      <div>{{ user.telegram_id }}{% if user.username %} · @{{ user.username }}{% endif %}{% if user.first_name %} · {{ user.first_name }}{% endif %}</div>
+      {% if payments_page %}
+        <div>Latest approved payments first</div>
+      {% else %}
+        <div>{{ user.telegram_id }}{% if user.username %} · @{{ user.username }}{% endif %}{% if user.first_name %} · {{ user.first_name }}{% endif %}</div>
+      {% endif %}
       <a class="back" href="/dashboard?filter={{ active_filter }}&search={{ search }}&page={{ page }}">Back to dashboard</a>
     </header>
     <main>
+      {% if payments_page %}
+        <form class="toolbar" method="get" action="/dashboard/payments">
+          <input name="search" value="{{ search }}" placeholder="Search telegram_id or username" autocomplete="off">
+          <button class="button" type="submit">Search</button>
+          <a class="button" href="/dashboard/payments">Clear</a>
+        </form>
+      {% endif %}
       <div class="table-wrap">
         {% if history %}
           <table>
             <thead>
               <tr>
+                <th>User</th>
+                <th>Telegram ID</th>
                 <th>Created At</th>
-                <th>Action</th>
-                <th>Payment Status</th>
+                <th>Expiry Date</th>
+                <th>Verified</th>
+                <th>Screenshot</th>
                 <th>Admin ID</th>
                 <th>Invite Link</th>
-                <th>Membership Start</th>
-                <th>Expiry Date</th>
                 <th>Notes</th>
               </tr>
             </thead>
             <tbody>
               {% for record in history %}
                 <tr>
+                  <td>{% if record.username %}@{{ record.username }}{% else %}{{ record.first_name or "-" }}{% endif %}</td>
+                  <td>{{ record.telegram_id }}</td>
                   <td>{{ record.created_at_display or "-" }}</td>
-                  <td>{{ record.action or "-" }}</td>
-                  <td>{{ record.payment_status or "-" }}</td>
+                  <td>{{ record.expiry_date or "-" }}</td>
+                  <td>{% if record.verified %}<span class="badge">Verified</span>{% else %}-{% endif %}</td>
+                  <td>
+                    {% if record.receipt_file_url %}
+                      {% if record.receipt_file_type == "photo" %}
+                        <img class="receipt-thumb" src="{{ record.receipt_file_url }}" alt="Payment receipt preview">
+                      {% endif %}
+                      <a class="button" href="{{ record.receipt_file_url }}" target="_blank" rel="noopener">Open screenshot</a>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
                   <td>{{ record.admin_id or "-" }}</td>
                   <td class="link-cell">{{ record.invite_link or "-" }}</td>
-                  <td>{{ record.membership_start_date or "-" }}</td>
-                  <td>{{ record.expiry_date or "-" }}</td>
                   <td>{{ record.notes or "-" }}</td>
                 </tr>
               {% endfor %}
             </tbody>
           </table>
         {% else %}
-          <div class="empty">No approved payment history found for this user.</div>
+          <div class="empty">No approved payment history found.</div>
         {% endif %}
       </div>
     </main>
