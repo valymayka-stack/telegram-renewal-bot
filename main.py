@@ -4,6 +4,7 @@ import os
 import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -16,7 +17,7 @@ from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKe
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
@@ -106,16 +107,21 @@ create table if not exists public.payment_history (
   action text default 'approved',
   payment_status text default 'paid',
   receipt_file_id text,
+  receipt_file_type text,
   invite_link text,
   membership_start_date date,
   expiry_date date,
+  verified boolean default true,
   notes text,
   created_at timestamptz default now()
 );
+alter table public.payment_history add column if not exists receipt_file_type text;
 alter table public.payment_history add column if not exists membership_start_date date;
 alter table public.payment_history add column if not exists expiry_date date;
+alter table public.payment_history add column if not exists verified boolean default true;
 alter table public.payment_history alter column action set default 'approved';
 alter table public.payment_history alter column payment_status set default 'paid';
+alter table public.payment_history alter column verified set default true;
 create index if not exists payment_history_telegram_id_idx
   on public.payment_history (telegram_id);
 create index if not exists payment_history_created_at_idx
@@ -359,9 +365,11 @@ def insert_payment_history(
     payment_status: str | None = None,
     admin_id: int | None = None,
     receipt_file_id: str | None = None,
+    receipt_file_type: str | None = None,
     invite_link: str | None = None,
     membership_start_date: str | None = None,
     expiry_date: str | None = None,
+    verified: bool = True,
     notes: str | None = None,
     username: str | None = None,
     first_name: str | None = None,
@@ -375,9 +383,11 @@ def insert_payment_history(
             "admin_id": admin_id,
             "action": action,
             "receipt_file_id": receipt_file_id,
+            "receipt_file_type": receipt_file_type,
             "invite_link": invite_link,
             "membership_start_date": membership_start_date,
             "expiry_date": expiry_date,
+            "verified": verified,
             "notes": notes,
         }
         supabase.table("payment_history").insert(payload).execute()
@@ -405,6 +415,7 @@ def get_payment_history(supabase: Client, telegram_id: int, limit: int | None = 
     rows = response.data or []
     for row in rows:
         row["created_at_display"] = format_local_datetime(row.get("created_at"))
+        row["receipt_file_url"] = payment_receipt_file_url(row.get("receipt_file_id"))
     return rows
 
 
@@ -418,6 +429,37 @@ def payment_history_telegram_ids(supabase: Client) -> set[int]:
         .execute()
     )
     return {int(row["telegram_id"]) for row in (response.data or []) if row.get("telegram_id") is not None}
+
+
+def payment_receipt_file_url(file_id: Any) -> str | None:
+    if not file_id:
+        return None
+    return f"/dashboard/payments/file?{urlencode({'file_id': str(file_id)})}"
+
+
+def list_approved_payments(supabase: Client, search: str = "", limit: int = 200) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("payment_history")
+        .select("*")
+        .eq("action", "approved")
+        .eq("payment_status", "paid")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    rows = response.data or []
+    search_term = search.strip().lower()
+    if search_term:
+        rows = [
+            row
+            for row in rows
+            if search_term in str(row.get("telegram_id") or "").lower()
+            or search_term in str(row.get("username") or "").lower()
+        ]
+    for row in rows:
+        row["created_at_display"] = format_local_datetime(row.get("created_at"))
+        row["receipt_file_url"] = payment_receipt_file_url(row.get("receipt_file_id"))
+    return rows
 
 
 def upsert_user_payload(supabase: Client, telegram_id: int, payload: dict[str, Any]) -> None:
@@ -798,10 +840,12 @@ async def approve_payment(
         "approved",
         "paid",
         admin_id,
-        None,
+        existing_user.get("pending_payment_file_id") if existing_user else None,
+        existing_user.get("pending_payment_file_type") if existing_user else None,
         invite_link,
         today.isoformat(),
         expiry.isoformat(),
+        True,
         "Payment approved by admin",
         existing_user.get("username") if existing_user else None,
         existing_user.get("first_name") if existing_user else None,
@@ -1192,6 +1236,7 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
     file_type = "photo" if message.photo else "document"
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     user = message.from_user
+    existing_user = await asyncio.to_thread(get_registered_user, supabase, user.id)
     payload = {
         "telegram_id": user.id,
         "username": user.username,
@@ -1206,6 +1251,14 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         "notes": "Payment receipt submitted privately",
     }
     await asyncio.to_thread(upsert_user_payload, supabase, user.id, payload)
+    if existing_user and existing_user.get("payment_status") == "pending_review":
+        await message.answer(
+            "Tu comprobante anterior fue actualizado ✅\n"
+            "Estamos validando tu pago y pronto recibirás tu acceso."
+        )
+        logger.info("Updated existing pending payment receipt telegram_id=%s", user.id)
+        return
+
     await message.answer("Comprobante recibido ✅ Lo revisaremos manualmente.")
 
     username = f"@{user.username}" if user.username else "-"
@@ -2252,6 +2305,57 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         except Exception as exc:
             logger.exception("Could not load payment history telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, search, page, error=f"Could not load payment history: {exc}")
+
+    @app.get("/dashboard/payments", response_class=HTMLResponse, response_model=None)
+    async def dashboard_payments(
+        request: Request,
+        search: str = "",
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        try:
+            rows = await asyncio.to_thread(list_approved_payments, supabase, search)
+            return templates.TemplateResponse(
+                request,
+                "payment_history.html",
+                {
+                    "request": request,
+                    "payments_page": True,
+                    "history": rows,
+                    "search": search,
+                    "active_filter": "all",
+                    "page": 1,
+                },
+            )
+        except Exception as exc:
+            logger.exception("Could not load approved payments")
+            return dashboard_redirect("all", error=f"Could not load approved payments: {exc}")
+
+    @app.get("/dashboard/payments/file", response_model=None)
+    async def dashboard_payment_file(
+        request: Request,
+        file_id: str,
+    ):
+        if not is_logged_in(request):
+            return Response(status_code=403)
+        try:
+            telegram_file = await bot.get_file(file_id)
+            if not telegram_file.file_path:
+                return Response(status_code=404)
+            buffer = BytesIO()
+            await bot.download_file(telegram_file.file_path, destination=buffer)
+            path = telegram_file.file_path.lower()
+            media_type = "image/jpeg"
+            if path.endswith(".png"):
+                media_type = "image/png"
+            elif path.endswith(".webp"):
+                media_type = "image/webp"
+            elif path.endswith(".pdf"):
+                media_type = "application/pdf"
+            return Response(content=buffer.getvalue(), media_type=media_type)
+        except Exception:
+            logger.warning("Could not proxy Telegram payment receipt file", exc_info=True)
+            return Response(status_code=404)
 
     @app.get("/dashboard/users/{telegram_id}/remove", response_class=HTMLResponse, response_model=None)
     async def dashboard_remove_confirm(
