@@ -74,9 +74,11 @@ create table if not exists payment_history (
   action text default 'approved',
   payment_status text default 'paid',
   receipt_file_id text,
+  receipt_file_type text,
   invite_link text,
   membership_start_date date,
   expiry_date date,
+  verified boolean default true,
   notes text,
   created_at timestamptz default now()
 );
@@ -160,16 +162,21 @@ create table if not exists public.payment_history (
   action text default 'approved',
   payment_status text default 'paid',
   receipt_file_id text,
+  receipt_file_type text,
   invite_link text,
   membership_start_date date,
   expiry_date date,
+  verified boolean default true,
   notes text,
   created_at timestamptz default now()
 );
+alter table public.payment_history add column if not exists receipt_file_type text;
 alter table public.payment_history add column if not exists membership_start_date date;
 alter table public.payment_history add column if not exists expiry_date date;
+alter table public.payment_history add column if not exists verified boolean default true;
 alter table public.payment_history alter column action set default 'approved';
 alter table public.payment_history alter column payment_status set default 'paid';
+alter table public.payment_history alter column verified set default true;
 create index if not exists payment_history_telegram_id_idx
   on public.payment_history (telegram_id);
 create index if not exists payment_history_created_at_idx
@@ -310,15 +317,15 @@ The dashboard stores signed session cookies and does not expose the Supabase ser
 
 ## Payment approval and renewal jobs
 
-Users send payment receipts to the bot in private chat as a photo or document. The bot marks them `pending_review` and sends admin buttons to `ADMIN_CHAT_ID`. Invite links are generated and sent only after an admin approves the payment.
+Users send payment receipts to the bot in private chat as a photo or document. The bot marks them `pending_review` and sends admin buttons to `ADMIN_CHAT_ID`. If a user sends another receipt while still pending review, the bot replaces the stored receipt reference and does not send another admin alert or create another approval button. Invite links are generated and sent only after an admin approves the payment.
 
 Payment history:
 
 - Only approved payments are appended to `payment_history`.
 - Pending receipts, rejected receipts, requests for another capture, and invite revocations are not stored as payment history.
-- Receipt image file IDs are not copied into payment history rows.
+- Receipt file IDs are copied into payment history only for approved payments so the dashboard can show a protected screenshot preview.
 - Payment history writes are best-effort: if the history table is unavailable, the main payment flow continues and the bot logs a warning.
-- Use `/payment_history <telegram_id>` or `/dashboard/users/{telegram_id}/history` to review approved payment history for one user.
+- Use `/payment_history <telegram_id>`, `/dashboard/users/{telegram_id}/history`, or `/dashboard/payments` to review approved payment history.
 
 Invite security:
 
