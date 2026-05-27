@@ -137,13 +137,17 @@ create table if not exists public.access_channels (
   label text not null,
   chat_id text not null,
   active boolean default true,
+  is_active boolean default true,
   expires_membership boolean default false,
+  has_expiry boolean default false,
   created_at timestamptz default now()
 );
 alter table public.access_channels add column if not exists label text;
 alter table public.access_channels add column if not exists chat_id text;
 alter table public.access_channels add column if not exists active boolean default true;
+alter table public.access_channels add column if not exists is_active boolean default true;
 alter table public.access_channels add column if not exists expires_membership boolean default false;
+alter table public.access_channels add column if not exists has_expiry boolean default false;
 alter table public.access_channels add column if not exists created_at timestamptz default now();
 create table if not exists public.user_channel_access (
   id bigserial primary key,
@@ -494,8 +498,26 @@ def grupo_access_channel(settings: Settings) -> dict[str, Any]:
         "label": GRUPO_CHANNEL_LABEL,
         "chat_id": str(settings.content_channel_id),
         "active": True,
+        "is_active": True,
         "expires_membership": True,
+        "has_expiry": True,
     }
+
+
+def channel_is_active(channel: dict[str, Any]) -> bool:
+    if "is_active" in channel:
+        return channel.get("is_active") is True
+    if "active" in channel:
+        return channel.get("active") is True
+    return True
+
+
+def channel_has_expiry(channel: dict[str, Any]) -> bool:
+    if "has_expiry" in channel:
+        return channel.get("has_expiry") is True
+    if "expires_membership" in channel:
+        return channel.get("expires_membership") is True
+    return channel.get("channel_key") == GRUPO_CHANNEL_KEY
 
 
 def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, Any]]:
@@ -504,10 +526,9 @@ def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, 
         response = (
             supabase.table("access_channels")
             .select("*")
-            .eq("active", True)
             .execute()
         )
-        channels = response.data or []
+        channels = [row for row in (response.data or []) if channel_is_active(row)]
     except Exception:
         logger.warning("Could not fetch access_channels; falling back to Grupo only", exc_info=True)
 
@@ -531,7 +552,9 @@ def ensure_grupo_access_channel(supabase: Client, settings: Settings) -> None:
                     "label": GRUPO_CHANNEL_LABEL,
                     "chat_id": str(settings.content_channel_id),
                     "active": True,
+                    "is_active": True,
                     "expires_membership": True,
+                    "has_expiry": True,
                 },
                 on_conflict="channel_key",
             )
@@ -1042,7 +1065,7 @@ async def approve_payment(
                 channel,
                 invite_link,
                 invite_name,
-                expiry.isoformat(),
+                expiry.isoformat() if channel_has_expiry(channel) else None,
             )
             continue
         chat_id = parse_stored_chat_id(channel["chat_id"])
@@ -1054,7 +1077,7 @@ async def approve_payment(
             channel,
             generated_link,
             generated_name,
-            expiry.isoformat() if channel["channel_key"] == GRUPO_CHANNEL_KEY else None,
+            expiry.isoformat() if channel_has_expiry(channel) else None,
         )
         channel_links.append({"label": str(channel.get("label") or channel["channel_key"]), "invite_link": generated_link})
         if channel["channel_key"] == GRUPO_CHANNEL_KEY:
