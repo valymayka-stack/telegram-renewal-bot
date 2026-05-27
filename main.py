@@ -1580,24 +1580,25 @@ async def users(message: Message, settings: Settings, supabase: Client) -> None:
 
 
 @router.message(Command("chat_id"))
+@router.channel_post(Command("chat_id"))
 async def chat_id(message: Message, settings: Settings) -> None:
-    if message.chat.type == "private" and not is_admin(message, settings):
-        await reject_non_admin(message)
+    admin_triggered = is_admin(message, settings)
+    bot_is_admin = False
+    try:
+        bot_user = await message.bot.get_me()
+        bot_member = await message.bot.get_chat_member(message.chat.id, bot_user.id)
+        bot_is_admin = bot_member.status in {"administrator", "creator"}
+    except Exception:
+        logger.warning("Could not verify bot admin status for /chat_id chat_id=%s", message.chat.id, exc_info=True)
+
+    if not admin_triggered and not bot_is_admin:
+        logger.warning("Ignoring /chat_id because sender and bot are not admin chat_id=%s", message.chat.id)
+        if message.chat.type == "private":
+            await reject_non_admin(message)
         return
-    if message.chat.type != "private":
-        try:
-            bot_user = await message.bot.get_me()
-            bot_member = await message.bot.get_chat_member(message.chat.id, bot_user.id)
-            bot_is_admin = bot_member.status in {"administrator", "creator"}
-        except Exception:
-            logger.warning("Could not verify bot admin status for /chat_id chat_id=%s", message.chat.id, exc_info=True)
-            return
-        if not bot_is_admin:
-            logger.warning("Ignoring /chat_id because bot is not admin chat_id=%s", message.chat.id)
-            return
 
     title = message.chat.title or getattr(message.chat, "full_name", None) or "-"
-    username = f"@{message.chat.username}" if message.chat.username else "-"
+    username = message.chat.username or "-"
     chat_type = message.chat.type
     text = (
         f"Chat ID: {message.chat.id}\n"
