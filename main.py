@@ -38,6 +38,10 @@ CONFIRM_SUBSCRIPTION_BUTTON_TEXT = "CONFIRMAR SUSCRIPCIÓN ✅"
 CONFIRM_SUBSCRIPTION_CALLBACK_DATA = "confirm_subscription_v1"
 CONFIRMATION_CAMPAIGN = "subscription_confirmation_v1"
 CONFIRMATION_SOURCE = "confirm_subscription_button"
+GRUPO_CHANNEL_KEY = "grupo"
+GRUPO_CHANNEL_LABEL = "Grupo"
+LADY_CHANNEL_KEY = "lady_in_red"
+LADY_CHANNEL_LABEL = "Lady in Red"
 DATE_FORMAT = "%Y-%m-%d"
 APP_TIMEZONE = ZoneInfo("America/Mexico_City")
 SCHEMA_MIGRATION_SQL = """
@@ -128,6 +132,55 @@ create index if not exists payment_history_created_at_idx
   on public.payment_history (created_at desc);
 create index if not exists payment_history_payment_status_idx
   on public.payment_history (payment_status);
+create table if not exists public.access_channels (
+  channel_key text primary key,
+  label text not null,
+  chat_id text not null,
+  active boolean default true,
+  expires_membership boolean default false,
+  created_at timestamptz default now()
+);
+alter table public.access_channels add column if not exists label text;
+alter table public.access_channels add column if not exists chat_id text;
+alter table public.access_channels add column if not exists active boolean default true;
+alter table public.access_channels add column if not exists expires_membership boolean default false;
+alter table public.access_channels add column if not exists created_at timestamptz default now();
+create table if not exists public.user_channel_access (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  channel_key text not null,
+  channel_label text,
+  chat_id text,
+  invite_link text,
+  invite_link_name text,
+  invite_link_created_at timestamptz,
+  invite_link_revoked boolean default false,
+  invite_link_used boolean default false,
+  access_status text default 'active',
+  granted_at timestamptz,
+  expires_at date,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique (telegram_id, channel_key)
+);
+alter table public.user_channel_access add column if not exists telegram_id bigint;
+alter table public.user_channel_access add column if not exists channel_key text;
+alter table public.user_channel_access add column if not exists channel_label text;
+alter table public.user_channel_access add column if not exists chat_id text;
+alter table public.user_channel_access add column if not exists invite_link text;
+alter table public.user_channel_access add column if not exists invite_link_name text;
+alter table public.user_channel_access add column if not exists invite_link_created_at timestamptz;
+alter table public.user_channel_access add column if not exists invite_link_revoked boolean default false;
+alter table public.user_channel_access add column if not exists invite_link_used boolean default false;
+alter table public.user_channel_access add column if not exists access_status text default 'active';
+alter table public.user_channel_access add column if not exists granted_at timestamptz;
+alter table public.user_channel_access add column if not exists expires_at date;
+alter table public.user_channel_access add column if not exists created_at timestamptz default now();
+alter table public.user_channel_access add column if not exists updated_at timestamptz default now();
+create index if not exists user_channel_access_telegram_id_idx
+  on public.user_channel_access (telegram_id);
+create index if not exists user_channel_access_channel_key_idx
+  on public.user_channel_access (channel_key);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -169,6 +222,10 @@ def parse_chat_id(value: str) -> int | str:
         return int(value)
     except ValueError as exc:
         raise RuntimeError("CONTENT_CHANNEL_ID must be a numeric chat ID or @channelusername") from exc
+
+
+def parse_stored_chat_id(value: Any) -> int | str:
+    return parse_chat_id(str(value))
 
 
 def parse_admin_ids(value: str) -> set[int]:
@@ -431,6 +488,75 @@ def payment_history_telegram_ids(supabase: Client) -> set[int]:
     return {int(row["telegram_id"]) for row in (response.data or []) if row.get("telegram_id") is not None}
 
 
+def grupo_access_channel(settings: Settings) -> dict[str, Any]:
+    return {
+        "channel_key": GRUPO_CHANNEL_KEY,
+        "label": GRUPO_CHANNEL_LABEL,
+        "chat_id": str(settings.content_channel_id),
+        "active": True,
+        "expires_membership": True,
+    }
+
+
+def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, Any]]:
+    channels: list[dict[str, Any]] = []
+    try:
+        response = (
+            supabase.table("access_channels")
+            .select("*")
+            .eq("active", True)
+            .execute()
+        )
+        channels = response.data or []
+    except Exception:
+        logger.warning("Could not fetch access_channels; falling back to Grupo only", exc_info=True)
+
+    by_key = {str(row.get("channel_key")): row for row in channels if row.get("channel_key") and row.get("chat_id")}
+    by_key.setdefault(GRUPO_CHANNEL_KEY, grupo_access_channel(settings))
+    ordered: list[dict[str, Any]] = []
+    for key in (GRUPO_CHANNEL_KEY, LADY_CHANNEL_KEY):
+        channel = by_key.get(key)
+        if channel:
+            ordered.append(channel)
+    return ordered
+
+
+def ensure_grupo_access_channel(supabase: Client, settings: Settings) -> None:
+    try:
+        (
+            supabase.table("access_channels")
+            .upsert(
+                {
+                    "channel_key": GRUPO_CHANNEL_KEY,
+                    "label": GRUPO_CHANNEL_LABEL,
+                    "chat_id": str(settings.content_channel_id),
+                    "active": True,
+                    "expires_membership": True,
+                },
+                on_conflict="channel_key",
+            )
+            .execute()
+        )
+    except Exception:
+        logger.warning("Could not ensure Grupo access channel", exc_info=True)
+
+
+def selected_channel_keys_from_raw(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    return {part for part in raw.split(",") if part}
+
+
+def selected_channel_keys_for_approval(selected_channel_keys: set[str] | None) -> set[str]:
+    if selected_channel_keys is None:
+        return {GRUPO_CHANNEL_KEY}
+    return set(selected_channel_keys)
+
+
+def encode_selected_channel_keys(keys: set[str]) -> str:
+    return ",".join(sorted(keys))
+
+
 def payment_receipt_file_url(file_id: Any) -> str | None:
     if not file_id:
         return None
@@ -629,15 +755,37 @@ def mark_user_paid(supabase: Client, telegram_id: int) -> None:
     )
 
 
-def pending_payment_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+def pending_payment_keyboard(
+    telegram_id: int,
+    channels: list[dict[str, Any]] | None = None,
+    selected_keys: set[str] | None = None,
+) -> InlineKeyboardMarkup:
+    selected = selected_keys or set()
+    channel_rows: list[list[InlineKeyboardButton]] = []
+    for channel in channels or []:
+        key = str(channel.get("channel_key"))
+        label = str(channel.get("label") or key)
+        marker = "✅ " if key in selected else ""
+        selected_raw = encode_selected_channel_keys(selected)
+        channel_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{marker}{label}",
+                    callback_data=f"payment:toggle:{telegram_id}:{selected_raw}:{key}",
+                )
+            ]
+        )
+
+    selected_raw = encode_selected_channel_keys(selected)
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            *channel_rows,
             [
-                InlineKeyboardButton(text="Aprobar ✅", callback_data=f"payment:approve:{telegram_id}"),
-                InlineKeyboardButton(text="Rechazar ❌", callback_data=f"payment:reject:{telegram_id}"),
+                InlineKeyboardButton(text="Approve selected ✅", callback_data=f"payment:approve:{telegram_id}:{selected_raw}"),
             ],
             [
-                InlineKeyboardButton(text="Pedir otra captura 🔁", callback_data=f"payment:ask_receipt:{telegram_id}"),
+                InlineKeyboardButton(text="Reject ❌", callback_data=f"payment:reject:{telegram_id}:{selected_raw}"),
+                InlineKeyboardButton(text="Ask another receipt 🔁", callback_data=f"payment:ask_receipt:{telegram_id}:{selected_raw}"),
             ],
         ]
     )
@@ -648,6 +796,18 @@ async def create_one_use_invite_link(bot: Bot, settings: Settings, telegram_id: 
     name = f"approved-{telegram_id}-{timestamp}"
     invite = await bot.create_chat_invite_link(
         chat_id=settings.content_channel_id,
+        name=name,
+        member_limit=1,
+        expire_date=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    return invite.invite_link, name
+
+
+async def create_one_use_invite_link_for_chat(bot: Bot, chat_id: int | str, telegram_id: int, channel_key: str) -> tuple[str, str]:
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    name = f"approved-{channel_key}-{telegram_id}-{timestamp}"[:32]
+    invite = await bot.create_chat_invite_link(
+        chat_id=chat_id,
         name=name,
         member_limit=1,
         expire_date=datetime.now(timezone.utc) + timedelta(hours=1),
@@ -696,6 +856,44 @@ async def save_invite_link(
             "notes": notes,
         },
     )
+
+
+def save_user_channel_access(
+    supabase: Client,
+    telegram_id: int,
+    channel: dict[str, Any],
+    invite_link: str,
+    invite_link_name: str,
+    expires_at: str | None = None,
+) -> None:
+    payload = {
+        "telegram_id": telegram_id,
+        "channel_key": channel["channel_key"],
+        "channel_label": channel.get("label"),
+        "chat_id": str(channel.get("chat_id")),
+        "invite_link": invite_link,
+        "invite_link_name": invite_link_name,
+        "invite_link_created_at": now_utc_iso(),
+        "invite_link_revoked": False,
+        "invite_link_used": False,
+        "access_status": "active",
+        "granted_at": now_utc_iso(),
+        "expires_at": expires_at,
+        "updated_at": now_utc_iso(),
+    }
+    try:
+        (
+            supabase.table("user_channel_access")
+            .upsert(payload, on_conflict="telegram_id,channel_key")
+            .execute()
+        )
+    except Exception:
+        logger.warning(
+            "Could not save user_channel_access telegram_id=%s channel_key=%s",
+            telegram_id,
+            channel.get("channel_key"),
+            exc_info=True,
+        )
 
 
 async def revoke_invite_for_user(
@@ -778,16 +976,39 @@ async def send_invite_to_user(bot: Bot, telegram_id: int, invite_link: str) -> b
         return False
 
 
+async def send_channel_invites_to_user(bot: Bot, telegram_id: int, channel_links: list[dict[str, str]]) -> bool:
+    lines = ["Pago aprobado ✅", ""]
+    for item in channel_links:
+        lines.append(f"{item['label']}:")
+        lines.append(item["invite_link"])
+        lines.append("")
+    try:
+        await bot.send_message(telegram_id, "\n".join(lines).strip())
+        return True
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM channel invite links to telegram_id=%s", telegram_id, exc_info=True)
+        return False
+
+
 async def approve_payment(
     bot: Bot,
     supabase: Client,
     settings: Settings,
     telegram_id: int,
     admin_id: int,
+    selected_channel_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    requested_keys = selected_channel_keys_for_approval(selected_channel_keys)
+    available_channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    channels_by_key = {str(channel["channel_key"]): channel for channel in available_channels}
+    selected_channels = [channels_by_key[key] for key in (GRUPO_CHANNEL_KEY, LADY_CHANNEL_KEY) if key in requested_keys and key in channels_by_key]
+    if not selected_channels:
+        raise ValueError("Selecciona al menos un canal disponible.")
+    includes_grupo = any(channel["channel_key"] == GRUPO_CHANNEL_KEY for channel in selected_channels)
+
     if payment_recently_approved(existing_user):
-        if has_active_unused_invite(existing_user):
+        if includes_grupo and len(selected_channels) == 1 and has_active_unused_invite(existing_user):
             invite_link = existing_user["invite_link"]
             dm_sent = await send_invite_to_user(bot, telegram_id, invite_link)
             if dm_sent:
@@ -804,28 +1025,63 @@ async def approve_payment(
 
     today = datetime.now(APP_TIMEZONE).date()
     expiry = today + timedelta(days=30)
-    reused_invite = has_active_unused_invite(existing_user)
+    reused_invite = includes_grupo and has_active_unused_invite(existing_user)
+    invite_link = ""
+    invite_name = ""
+    channel_links: list[dict[str, str]] = []
     if reused_invite:
         invite_link = existing_user["invite_link"]
         invite_name = existing_user.get("invite_link_name") or f"existing-{telegram_id}"
-    else:
-        invite_link, invite_name = await create_one_use_invite_link(bot, settings, telegram_id)
+        channel_links.append({"label": GRUPO_CHANNEL_LABEL, "invite_link": invite_link})
+    for channel in selected_channels:
+        if channel["channel_key"] == GRUPO_CHANNEL_KEY and reused_invite:
+            await asyncio.to_thread(
+                save_user_channel_access,
+                supabase,
+                telegram_id,
+                channel,
+                invite_link,
+                invite_name,
+                expiry.isoformat(),
+            )
+            continue
+        chat_id = parse_stored_chat_id(channel["chat_id"])
+        generated_link, generated_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, str(channel["channel_key"]))
+        await asyncio.to_thread(
+            save_user_channel_access,
+            supabase,
+            telegram_id,
+            channel,
+            generated_link,
+            generated_name,
+            expiry.isoformat() if channel["channel_key"] == GRUPO_CHANNEL_KEY else None,
+        )
+        channel_links.append({"label": str(channel.get("label") or channel["channel_key"]), "invite_link": generated_link})
+        if channel["channel_key"] == GRUPO_CHANNEL_KEY:
+            invite_link = generated_link
+            invite_name = generated_name
+
     approval_payload = {
         "telegram_id": telegram_id,
         "status": "active",
         "payment_status": "paid",
         "approved_by_admin_id": admin_id,
         "approved_at": now_utc_iso(),
-        "membership_start_date": today.isoformat(),
-        "expiry_date": expiry.isoformat(),
         "last_payment_at": now_utc_iso(),
-        "invite_link": invite_link,
-        "invite_link_name": invite_name,
-        "invite_link_revoked": False,
-        "invite_link_used": False,
         "notes": "Payment approved by admin",
     }
-    if not reused_invite:
+    if includes_grupo:
+        approval_payload.update(
+            {
+                "membership_start_date": today.isoformat(),
+                "expiry_date": expiry.isoformat(),
+                "invite_link": invite_link,
+                "invite_link_name": invite_name,
+                "invite_link_revoked": False,
+                "invite_link_used": False,
+            }
+        )
+    if includes_grupo and not reused_invite:
         approval_payload["invite_link_created_at"] = now_utc_iso()
     await asyncio.to_thread(
         upsert_user_payload,
@@ -842,15 +1098,15 @@ async def approve_payment(
         admin_id,
         existing_user.get("pending_payment_file_id") if existing_user else None,
         existing_user.get("pending_payment_file_type") if existing_user else None,
-        invite_link,
-        today.isoformat(),
-        expiry.isoformat(),
+        "\n".join(f"{item['label']}: {item['invite_link']}" for item in channel_links),
+        today.isoformat() if includes_grupo else None,
+        expiry.isoformat() if includes_grupo else None,
         True,
         "Payment approved by admin",
         existing_user.get("username") if existing_user else None,
         existing_user.get("first_name") if existing_user else None,
     )
-    dm_sent = await send_invite_to_user(bot, telegram_id, invite_link)
+    dm_sent = await send_channel_invites_to_user(bot, telegram_id, channel_links)
     if dm_sent:
         await bot.send_message(settings.admin_chat_id, f"Pago aprobado y link enviado a {telegram_id}")
     else:
@@ -859,7 +1115,7 @@ async def approve_payment(
             "No pude enviar el link. El usuario debe abrir el bot o escribirle primero.",
         )
     logger.info("Payment approved telegram_id=%s admin_id=%s dm_sent=%s", telegram_id, admin_id, dm_sent)
-    return {"invite_link": invite_link, "duplicate": False, "reused": reused_invite}
+    return {"invite_link": invite_link, "channel_links": channel_links, "duplicate": False, "reused": reused_invite}
 
 
 async def reject_payment(
@@ -1279,7 +1535,11 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         await message.bot.send_message(
             settings.admin_chat_id,
             admin_text,
-            reply_markup=pending_payment_keyboard(user.id),
+            reply_markup=pending_payment_keyboard(
+                user.id,
+                await asyncio.to_thread(get_access_channels, supabase, settings),
+                {GRUPO_CHANNEL_KEY},
+            ),
         )
         logger.info("Payment receipt submitted telegram_id=%s", user.id)
     except Exception:
@@ -1317,6 +1577,48 @@ async def users(message: Message, settings: Settings, supabase: Client) -> None:
     if not latest:
         lines.append("Sin usuarios registrados todavía.")
     await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("chat_id"))
+async def chat_id(message: Message, settings: Settings) -> None:
+    if message.chat.type == "private" and not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    if message.chat.type != "private":
+        try:
+            bot_user = await message.bot.get_me()
+            bot_member = await message.bot.get_chat_member(message.chat.id, bot_user.id)
+            bot_is_admin = bot_member.status in {"administrator", "creator"}
+        except Exception:
+            logger.warning("Could not verify bot admin status for /chat_id chat_id=%s", message.chat.id, exc_info=True)
+            return
+        if not bot_is_admin:
+            logger.warning("Ignoring /chat_id because bot is not admin chat_id=%s", message.chat.id)
+            return
+
+    title = message.chat.title or getattr(message.chat, "full_name", None) or "-"
+    username = f"@{message.chat.username}" if message.chat.username else "-"
+    chat_type = message.chat.type
+    text = (
+        f"Chat ID: {message.chat.id}\n"
+        f"Title: {title}\n"
+        f"Username: {username}\n"
+        f"Type: {chat_type}"
+    )
+    logger.info(
+        "Chat ID requested chat_id=%s title=%s username=%s type=%s",
+        message.chat.id,
+        title,
+        username,
+        chat_type,
+    )
+    try:
+        await message.bot.send_message(settings.admin_chat_id, text)
+        if message.chat.id != settings.admin_chat_id:
+            await message.answer("Chat ID enviado al admin.")
+    except Exception as exc:
+        logger.exception("Could not send chat id to admin")
+        await message.answer(f"No pude enviar el chat id: {exc}")
 
 
 def command_telegram_id(message: Message) -> int | None:
@@ -1665,6 +1967,7 @@ async def sync_schema(message: Message, settings: Settings, supabase: Client) ->
 
     try:
         await asyncio.to_thread(run_schema_migration, supabase)
+        await asyncio.to_thread(ensure_grupo_access_channel, supabase, settings)
         await message.answer("Schema sincronizado correctamente.")
     except Exception as exc:
         logger.exception("Could not sync schema")
@@ -1705,7 +2008,7 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
         await callback_query.answer("No autorizado.", show_alert=True)
         return
     parts = (callback_query.data or "").split(":")
-    if len(parts) != 3:
+    if len(parts) < 3:
         await callback_query.answer("Acción inválida.", show_alert=True)
         return
     action = parts[1]
@@ -1716,8 +2019,38 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
         return
 
     try:
-        if action == "approve":
-            result = await approve_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
+        if action == "toggle":
+            if len(parts) != 5:
+                await callback_query.answer("Acción inválida.", show_alert=True)
+                return
+            selected = selected_channel_keys_from_raw(parts[3])
+            key = parts[4]
+            channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+            available_keys = {str(channel["channel_key"]) for channel in channels}
+            if key not in available_keys:
+                await callback_query.answer("Canal no disponible.", show_alert=True)
+                return
+            if key in selected:
+                selected.remove(key)
+            else:
+                selected.add(key)
+            await callback_query.message.edit_reply_markup(
+                reply_markup=pending_payment_keyboard(telegram_id, channels, selected)
+            )
+            await callback_query.answer("Selección actualizada")
+        elif action == "approve":
+            selected = selected_channel_keys_from_raw(parts[3]) if len(parts) >= 4 else {GRUPO_CHANNEL_KEY}
+            if not selected:
+                await callback_query.answer("Selecciona al menos un canal.", show_alert=True)
+                return
+            result = await approve_payment(
+                callback_query.bot,
+                supabase,
+                settings,
+                telegram_id,
+                callback_query.from_user.id,
+                selected,
+            )
             if result.get("duplicate"):
                 await callback_query.answer("Ya estaba aprobado; reenvié el link existente.", show_alert=True)
             else:
@@ -2423,9 +2756,10 @@ async def run_web_server(app: FastAPI) -> None:
     await server.serve()
 
 
-async def run_startup_migration(supabase: Client) -> None:
+async def run_startup_migration(supabase: Client, settings: Settings) -> None:
     try:
         await asyncio.to_thread(run_schema_migration, supabase)
+        await asyncio.to_thread(ensure_grupo_access_channel, supabase, settings)
         logger.info("Schema migration completed")
     except Exception:
         logger.warning("Schema migration skipped or failed; use /sync_schema or run README SQL", exc_info=True)
@@ -2438,7 +2772,7 @@ async def main() -> None:
     bot = Bot(settings.bot_token)
     app = create_web_app(settings, supabase, bot)
 
-    asyncio.create_task(run_startup_migration(supabase), name="schema-migration")
+    asyncio.create_task(run_startup_migration(supabase, settings), name="schema-migration")
     bot_task = asyncio.create_task(run_telegram_bot(bot, supabase, settings), name="telegram-bot")
     web_task = asyncio.create_task(run_web_server(app), name="web-server")
     try:
