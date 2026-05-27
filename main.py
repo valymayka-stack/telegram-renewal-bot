@@ -536,6 +536,10 @@ def channel_label(channel: dict[str, Any]) -> str:
     return code or "Canal"
 
 
+def channel_telegram_chat_id(channel: dict[str, Any]) -> Any:
+    return channel.get("telegram_chat_id") or channel.get("chat_id")
+
+
 def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, Any]]:
     try:
         response = (
@@ -907,7 +911,7 @@ def save_user_channel_access(
         "telegram_id": telegram_id,
         "channel_key": channel_code(channel),
         "channel_label": channel_label(channel),
-        "chat_id": str(channel.get("chat_id")),
+        "chat_id": str(channel_telegram_chat_id(channel)),
         "invite_link": invite_link,
         "invite_link_name": invite_link_name,
         "invite_link_created_at": now_utc_iso(),
@@ -1087,7 +1091,11 @@ async def approve_payment(
                 expiry.isoformat() if channel_has_expiry(channel) else None,
             )
             continue
-        chat_id = parse_stored_chat_id(channel["chat_id"])
+        telegram_chat_id = channel_telegram_chat_id(channel)
+        if not telegram_chat_id:
+            logger.error("Selected approval channel is missing telegram_chat_id: %s", channel)
+            raise ValueError(f"Canal {channel_label(channel)} no tiene telegram_chat_id configurado.")
+        chat_id = parse_stored_chat_id(telegram_chat_id)
         generated_link, generated_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, code)
         await asyncio.to_thread(
             save_user_channel_access,
