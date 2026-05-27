@@ -517,18 +517,23 @@ def channel_has_expiry(channel: dict[str, Any]) -> bool:
         return channel.get("has_expiry") is True
     if "expires_membership" in channel:
         return channel.get("expires_membership") is True
-    return channel.get("channel_key") == GRUPO_CHANNEL_KEY
+    return channel_code(channel) == GRUPO_CHANNEL_KEY
+
+
+def channel_code(channel: dict[str, Any]) -> str:
+    return str(channel.get("code") or channel.get("channel_key") or "")
 
 
 def channel_label(channel: dict[str, Any]) -> str:
     label = channel.get("label") or channel.get("title") or channel.get("name")
     if label:
         return str(label)
-    if channel.get("channel_key") == GRUPO_CHANNEL_KEY:
+    code = channel_code(channel)
+    if code == GRUPO_CHANNEL_KEY:
         return GRUPO_CHANNEL_LABEL
-    if channel.get("channel_key") == LADY_CHANNEL_KEY:
+    if code == LADY_CHANNEL_KEY:
         return LADY_CHANNEL_LABEL
-    return str(channel.get("channel_key") or "Canal")
+    return code or "Canal"
 
 
 def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, Any]]:
@@ -537,10 +542,9 @@ def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, 
             supabase.table("access_channels")
             .select("*")
             .eq("is_active", True)
-            .order("sort_order")
             .execute()
         )
-        channels = [row for row in (response.data or []) if row.get("channel_key")]
+        channels = [row for row in (response.data or []) if channel_code(row)]
         logger.info("Loaded approval channels: %s", channels)
         return channels
     except Exception:
@@ -577,7 +581,7 @@ def selected_channel_keys_from_raw(raw: str | None) -> set[str]:
 
 
 def selected_channel_keys_for_approval(selected_channel_keys: set[str] | None) -> set[str]:
-    if selected_channel_keys is None:
+    if not selected_channel_keys:
         return {GRUPO_CHANNEL_KEY}
     return set(selected_channel_keys)
 
@@ -785,14 +789,18 @@ def mark_user_paid(supabase: Client, telegram_id: int) -> None:
 
 
 def pending_payment_keyboard(
+    supabase: Client,
+    settings: Settings,
     telegram_id: int,
-    channels: list[dict[str, Any]] | None = None,
     selected_keys: set[str] | None = None,
 ) -> InlineKeyboardMarkup:
-    selected = selected_keys or set()
+    channels = get_access_channels(supabase, settings)
+    selected = set(selected_keys or set())
+    if not selected:
+        selected.add(GRUPO_CHANNEL_KEY)
     channel_rows: list[list[InlineKeyboardButton]] = []
-    for channel in channels or []:
-        key = str(channel.get("channel_key"))
+    for channel in channels:
+        key = channel_code(channel)
         label = channel_label(channel)
         marker = "✅ " if key in selected else "⬜ "
         selected_raw = encode_selected_channel_keys(selected)
@@ -897,7 +905,7 @@ def save_user_channel_access(
 ) -> None:
     payload = {
         "telegram_id": telegram_id,
-        "channel_key": channel["channel_key"],
+        "channel_key": channel_code(channel),
         "channel_label": channel_label(channel),
         "chat_id": str(channel.get("chat_id")),
         "invite_link": invite_link,
@@ -920,7 +928,7 @@ def save_user_channel_access(
         logger.warning(
             "Could not save user_channel_access telegram_id=%s channel_key=%s",
             telegram_id,
-            channel.get("channel_key"),
+            channel_code(channel),
             exc_info=True,
         )
 
@@ -1030,15 +1038,14 @@ async def approve_payment(
     existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
     requested_keys = selected_channel_keys_for_approval(selected_channel_keys)
     available_channels = await asyncio.to_thread(get_access_channels, supabase, settings)
-    channels_by_key = {str(channel["channel_key"]): channel for channel in available_channels}
     selected_channels = [
         channel
         for channel in available_channels
-        if str(channel.get("channel_key")) in requested_keys and str(channel.get("channel_key")) in channels_by_key
+        if channel_code(channel) in requested_keys
     ]
     if not selected_channels:
         raise ValueError("Selecciona al menos un canal disponible.")
-    includes_grupo = any(channel["channel_key"] == GRUPO_CHANNEL_KEY for channel in selected_channels)
+    includes_grupo = any(channel_code(channel) == GRUPO_CHANNEL_KEY for channel in selected_channels)
     includes_expiring_channel = any(channel_has_expiry(channel) for channel in selected_channels)
 
     if payment_recently_approved(existing_user):
@@ -1068,7 +1075,8 @@ async def approve_payment(
         invite_name = existing_user.get("invite_link_name") or f"existing-{telegram_id}"
         channel_links.append({"label": GRUPO_CHANNEL_LABEL, "invite_link": invite_link})
     for channel in selected_channels:
-        if channel["channel_key"] == GRUPO_CHANNEL_KEY and reused_invite:
+        code = channel_code(channel)
+        if code == GRUPO_CHANNEL_KEY and reused_invite:
             await asyncio.to_thread(
                 save_user_channel_access,
                 supabase,
@@ -1080,7 +1088,7 @@ async def approve_payment(
             )
             continue
         chat_id = parse_stored_chat_id(channel["chat_id"])
-        generated_link, generated_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, str(channel["channel_key"]))
+        generated_link, generated_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, code)
         await asyncio.to_thread(
             save_user_channel_access,
             supabase,
@@ -1091,7 +1099,7 @@ async def approve_payment(
             expiry.isoformat() if channel_has_expiry(channel) else None,
         )
         channel_links.append({"label": channel_label(channel), "invite_link": generated_link})
-        if channel["channel_key"] == GRUPO_CHANNEL_KEY:
+        if code == GRUPO_CHANNEL_KEY:
             invite_link = generated_link
             invite_name = generated_name
 
@@ -1574,9 +1582,11 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         await message.bot.send_message(
             settings.admin_chat_id,
             admin_text,
-            reply_markup=pending_payment_keyboard(
+            reply_markup=await asyncio.to_thread(
+                pending_payment_keyboard,
+                supabase,
+                settings,
                 user.id,
-                await asyncio.to_thread(get_access_channels, supabase, settings),
                 {GRUPO_CHANNEL_KEY},
             ),
         )
@@ -2066,7 +2076,7 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             selected = selected_channel_keys_from_raw(parts[3])
             key = parts[4]
             channels = await asyncio.to_thread(get_access_channels, supabase, settings)
-            available_keys = {str(channel["channel_key"]) for channel in channels}
+            available_keys = {channel_code(channel) for channel in channels}
             if key not in available_keys:
                 await callback_query.answer("Canal no disponible.", show_alert=True)
                 return
@@ -2075,14 +2085,19 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             else:
                 selected.add(key)
             await callback_query.message.edit_reply_markup(
-                reply_markup=pending_payment_keyboard(telegram_id, channels, selected)
+                reply_markup=await asyncio.to_thread(
+                    pending_payment_keyboard,
+                    supabase,
+                    settings,
+                    telegram_id,
+                    selected,
+                )
             )
             await callback_query.answer("Selección actualizada")
         elif action == "approve":
             selected = selected_channel_keys_from_raw(parts[3]) if len(parts) >= 4 else {GRUPO_CHANNEL_KEY}
             if not selected:
-                await callback_query.answer("Selecciona al menos un canal.", show_alert=True)
-                return
+                selected = {GRUPO_CHANNEL_KEY}
             result = await approve_payment(
                 callback_query.bot,
                 supabase,
