@@ -532,26 +532,20 @@ def channel_label(channel: dict[str, Any]) -> str:
 
 
 def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, Any]]:
-    channels: list[dict[str, Any]] = []
     try:
         response = (
             supabase.table("access_channels")
             .select("*")
             .eq("is_active", True)
+            .order("sort_order")
             .execute()
         )
-        channels = [
-            row
-            for row in (response.data or [])
-            if channel_is_active(row) and row.get("channel_key") and row.get("chat_id")
-        ]
+        channels = [row for row in (response.data or []) if row.get("channel_key")]
+        logger.info("Loaded approval channels: %s", channels)
+        return channels
     except Exception:
-        logger.warning("Could not fetch access_channels; falling back to Grupo only", exc_info=True)
-        return [grupo_access_channel(settings)]
-
-    if not channels:
-        return [grupo_access_channel(settings)]
-    return channels
+        logger.warning("Could not fetch approval channels from access_channels", exc_info=True)
+        return []
 
 
 def ensure_grupo_access_channel(supabase: Client, settings: Settings) -> None:
@@ -800,7 +794,7 @@ def pending_payment_keyboard(
     for channel in channels or []:
         key = str(channel.get("channel_key"))
         label = channel_label(channel)
-        marker = "✅ " if key in selected else ""
+        marker = "✅ " if key in selected else "⬜ "
         selected_raw = encode_selected_channel_keys(selected)
         channel_rows.append(
             [
