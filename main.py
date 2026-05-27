@@ -520,26 +520,38 @@ def channel_has_expiry(channel: dict[str, Any]) -> bool:
     return channel.get("channel_key") == GRUPO_CHANNEL_KEY
 
 
+def channel_label(channel: dict[str, Any]) -> str:
+    label = channel.get("label") or channel.get("title") or channel.get("name")
+    if label:
+        return str(label)
+    if channel.get("channel_key") == GRUPO_CHANNEL_KEY:
+        return GRUPO_CHANNEL_LABEL
+    if channel.get("channel_key") == LADY_CHANNEL_KEY:
+        return LADY_CHANNEL_LABEL
+    return str(channel.get("channel_key") or "Canal")
+
+
 def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, Any]]:
     channels: list[dict[str, Any]] = []
     try:
         response = (
             supabase.table("access_channels")
             .select("*")
+            .eq("is_active", True)
             .execute()
         )
-        channels = [row for row in (response.data or []) if channel_is_active(row)]
+        channels = [
+            row
+            for row in (response.data or [])
+            if channel_is_active(row) and row.get("channel_key") and row.get("chat_id")
+        ]
     except Exception:
         logger.warning("Could not fetch access_channels; falling back to Grupo only", exc_info=True)
+        return [grupo_access_channel(settings)]
 
-    by_key = {str(row.get("channel_key")): row for row in channels if row.get("channel_key") and row.get("chat_id")}
-    by_key.setdefault(GRUPO_CHANNEL_KEY, grupo_access_channel(settings))
-    ordered: list[dict[str, Any]] = []
-    for key in (GRUPO_CHANNEL_KEY, LADY_CHANNEL_KEY):
-        channel = by_key.get(key)
-        if channel:
-            ordered.append(channel)
-    return ordered
+    if not channels:
+        return [grupo_access_channel(settings)]
+    return channels
 
 
 def ensure_grupo_access_channel(supabase: Client, settings: Settings) -> None:
@@ -787,7 +799,7 @@ def pending_payment_keyboard(
     channel_rows: list[list[InlineKeyboardButton]] = []
     for channel in channels or []:
         key = str(channel.get("channel_key"))
-        label = str(channel.get("label") or key)
+        label = channel_label(channel)
         marker = "✅ " if key in selected else ""
         selected_raw = encode_selected_channel_keys(selected)
         channel_rows.append(
@@ -892,7 +904,7 @@ def save_user_channel_access(
     payload = {
         "telegram_id": telegram_id,
         "channel_key": channel["channel_key"],
-        "channel_label": channel.get("label"),
+        "channel_label": channel_label(channel),
         "chat_id": str(channel.get("chat_id")),
         "invite_link": invite_link,
         "invite_link_name": invite_link_name,
@@ -1025,10 +1037,15 @@ async def approve_payment(
     requested_keys = selected_channel_keys_for_approval(selected_channel_keys)
     available_channels = await asyncio.to_thread(get_access_channels, supabase, settings)
     channels_by_key = {str(channel["channel_key"]): channel for channel in available_channels}
-    selected_channels = [channels_by_key[key] for key in (GRUPO_CHANNEL_KEY, LADY_CHANNEL_KEY) if key in requested_keys and key in channels_by_key]
+    selected_channels = [
+        channel
+        for channel in available_channels
+        if str(channel.get("channel_key")) in requested_keys and str(channel.get("channel_key")) in channels_by_key
+    ]
     if not selected_channels:
         raise ValueError("Selecciona al menos un canal disponible.")
     includes_grupo = any(channel["channel_key"] == GRUPO_CHANNEL_KEY for channel in selected_channels)
+    includes_expiring_channel = any(channel_has_expiry(channel) for channel in selected_channels)
 
     if payment_recently_approved(existing_user):
         if includes_grupo and len(selected_channels) == 1 and has_active_unused_invite(existing_user):
@@ -1079,7 +1096,7 @@ async def approve_payment(
             generated_name,
             expiry.isoformat() if channel_has_expiry(channel) else None,
         )
-        channel_links.append({"label": str(channel.get("label") or channel["channel_key"]), "invite_link": generated_link})
+        channel_links.append({"label": channel_label(channel), "invite_link": generated_link})
         if channel["channel_key"] == GRUPO_CHANNEL_KEY:
             invite_link = generated_link
             invite_name = generated_name
@@ -1093,11 +1110,16 @@ async def approve_payment(
         "last_payment_at": now_utc_iso(),
         "notes": "Payment approved by admin",
     }
-    if includes_grupo:
+    if includes_expiring_channel:
         approval_payload.update(
             {
                 "membership_start_date": today.isoformat(),
                 "expiry_date": expiry.isoformat(),
+            }
+        )
+    if includes_grupo:
+        approval_payload.update(
+            {
                 "invite_link": invite_link,
                 "invite_link_name": invite_name,
                 "invite_link_revoked": False,
@@ -1122,8 +1144,8 @@ async def approve_payment(
         existing_user.get("pending_payment_file_id") if existing_user else None,
         existing_user.get("pending_payment_file_type") if existing_user else None,
         "\n".join(f"{item['label']}: {item['invite_link']}" for item in channel_links),
-        today.isoformat() if includes_grupo else None,
-        expiry.isoformat() if includes_grupo else None,
+        today.isoformat() if includes_expiring_channel else None,
+        expiry.isoformat() if includes_expiring_channel else None,
         True,
         "Payment approved by admin",
         existing_user.get("username") if existing_user else None,
