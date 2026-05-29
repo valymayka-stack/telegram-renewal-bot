@@ -176,6 +176,7 @@ alter table public.user_channel_access add column if not exists invite_link_name
 alter table public.user_channel_access add column if not exists invite_link_created_at timestamptz;
 alter table public.user_channel_access add column if not exists invite_link_revoked boolean default false;
 alter table public.user_channel_access add column if not exists invite_link_used boolean default false;
+alter table public.user_channel_access add column if not exists status text default 'active';
 alter table public.user_channel_access add column if not exists access_status text default 'active';
 alter table public.user_channel_access add column if not exists granted_at timestamptz;
 alter table public.user_channel_access add column if not exists expires_at date;
@@ -185,6 +186,26 @@ create index if not exists user_channel_access_telegram_id_idx
   on public.user_channel_access (telegram_id);
 create index if not exists user_channel_access_channel_key_idx
   on public.user_channel_access (channel_key);
+alter table public.user_channel_access add column if not exists joined_channel_at timestamptz;
+create table if not exists public.manual_invite_links (
+  id bigserial primary key,
+  channel_code text,
+  telegram_chat_id text,
+  invite_link text,
+  invite_link_name text,
+  created_by_admin_id bigint,
+  created_at timestamptz default now(),
+  expires_at timestamptz,
+  used_by_telegram_id bigint,
+  used_at timestamptz,
+  revoked boolean default false,
+  revoked_at timestamptz,
+  notes text
+);
+create index if not exists manual_invite_links_invite_link_idx
+  on public.manual_invite_links (invite_link);
+create index if not exists manual_invite_links_channel_code_idx
+  on public.manual_invite_links (channel_code);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -556,6 +577,107 @@ def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, 
         return []
 
 
+def get_access_channel_by_code(supabase: Client, requested_code: str) -> dict[str, Any] | None:
+    response = (
+        supabase.table("access_channels")
+        .select("*")
+        .eq("is_active", True)
+        .execute()
+    )
+    for channel in response.data or []:
+        if channel_code(channel) == requested_code:
+            return channel
+    return None
+
+
+def find_access_channel_for_chat(supabase: Client, settings: Settings, chat_id: int, username: str | None = None) -> dict[str, Any] | None:
+    for channel in get_access_channels(supabase, settings):
+        telegram_chat_id = channel_telegram_chat_id(channel)
+        if telegram_chat_id is None:
+            continue
+        try:
+            parsed_chat_id = parse_stored_chat_id(telegram_chat_id)
+            if parsed_chat_id == chat_id:
+                return channel
+            if isinstance(parsed_chat_id, str) and username and parsed_chat_id.lstrip("@").lower() == username.lower():
+                return channel
+        except RuntimeError:
+            if username and str(telegram_chat_id).lstrip("@").lower() == username.lower():
+                return channel
+    if chat_id == settings.content_channel_id:
+        return grupo_access_channel(settings)
+    return None
+
+
+def save_manual_invite_link(
+    supabase: Client,
+    channel: dict[str, Any],
+    invite_link: str,
+    invite_link_name: str,
+    admin_id: int,
+    expires_at: datetime,
+) -> None:
+    (
+        supabase.table("manual_invite_links")
+        .insert(
+            {
+                "channel_code": channel_code(channel),
+                "telegram_chat_id": str(channel_telegram_chat_id(channel)),
+                "invite_link": invite_link,
+                "invite_link_name": invite_link_name,
+                "created_by_admin_id": admin_id,
+                "created_at": now_utc_iso(),
+                "expires_at": expires_at.isoformat(),
+                "revoked": False,
+                "notes": "Manual open invite link created by admin",
+            }
+        )
+        .execute()
+    )
+
+
+def get_manual_invite_by_link(supabase: Client, invite_link: str) -> dict[str, Any] | None:
+    response = (
+        supabase.table("manual_invite_links")
+        .select("*")
+        .eq("invite_link", invite_link)
+        .eq("revoked", False)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def mark_manual_invite_used(supabase: Client, invite_link: str, telegram_id: int) -> None:
+    (
+        supabase.table("manual_invite_links")
+        .update({"used_by_telegram_id": telegram_id, "used_at": now_utc_iso()})
+        .eq("invite_link", invite_link)
+        .execute()
+    )
+
+
+def is_blacklisted_user(supabase: Client, telegram_id: int) -> bool:
+    user = get_registered_user(supabase, telegram_id)
+    if user and (
+        user.get("status") == "blacklisted"
+        or user.get("is_blacklisted") is True
+        or user.get("blacklisted") is True
+    ):
+        return True
+    try:
+        response = (
+            supabase.table("blacklisted_users")
+            .select("*")
+            .eq("telegram_id", telegram_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(response.data)
+    except Exception:
+        return False
+
+
 def ensure_grupo_access_channel(supabase: Client, settings: Settings) -> None:
     try:
         (
@@ -856,6 +978,19 @@ async def create_one_use_invite_link_for_chat(bot: Bot, chat_id: int | str, tele
     return invite.invite_link, name
 
 
+async def create_manual_open_invite_link(bot: Bot, chat_id: int | str, channel_code_value: str) -> tuple[str, str, datetime]:
+    timestamp = int(datetime.now(timezone.utc).timestamp())
+    name = f"manual-open-{channel_code_value}-{timestamp}"[:32]
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    invite = await bot.create_chat_invite_link(
+        chat_id=chat_id,
+        name=name,
+        member_limit=1,
+        expire_date=expires_at,
+    )
+    return invite.invite_link, name, expires_at
+
+
 def has_active_unused_invite(row: dict[str, Any] | None) -> bool:
     if not row or not row.get("invite_link"):
         return False
@@ -917,8 +1052,10 @@ def save_user_channel_access(
         "invite_link_created_at": now_utc_iso(),
         "invite_link_revoked": False,
         "invite_link_used": False,
+        "status": "active",
         "access_status": "active",
         "granted_at": now_utc_iso(),
+        "joined_channel_at": now_utc_iso(),
         "expires_at": expires_at,
         "updated_at": now_utc_iso(),
     }
@@ -1792,6 +1929,55 @@ async def send_invite(message: Message, settings: Settings, supabase: Client) ->
         await message.answer(f"No pude enviar/generar link: {exc}")
 
 
+@router.message(Command("manual_open_link"))
+async def manual_open_link(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    if not message.from_user:
+        await message.answer("No pude identificar al admin.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer("Uso: /manual_open_link CHANNEL_CODE")
+        return
+
+    requested_code = parts[1].strip()
+    try:
+        channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
+        if not channel:
+            await message.answer("Canal no encontrado o inactivo.")
+            return
+        telegram_chat_id = channel_telegram_chat_id(channel)
+        if not telegram_chat_id:
+            logger.error("Manual open channel missing telegram_chat_id: %s", channel)
+            await message.answer(f"Canal {requested_code} no tiene telegram_chat_id configurado.")
+            return
+        chat_id = parse_stored_chat_id(telegram_chat_id)
+        invite_link, invite_name, expires_at = await create_manual_open_invite_link(
+            message.bot,
+            chat_id,
+            channel_code(channel),
+        )
+        await asyncio.to_thread(
+            save_manual_invite_link,
+            supabase,
+            channel,
+            invite_link,
+            invite_name,
+            message.from_user.id,
+            expires_at,
+        )
+        await message.bot.send_message(
+            settings.admin_chat_id,
+            f"Manual open invite link\n{channel_label(channel)}:\n{invite_link}",
+        )
+        await message.answer("Link manual enviado al admin.")
+    except Exception as exc:
+        logger.exception("Could not create manual open invite link channel_code=%s", requested_code)
+        await message.answer(f"No pude crear el link manual: {exc}")
+
+
 @router.message(Command("revoke_invite"))
 async def revoke_invite(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -1849,6 +2035,19 @@ async def revoke_link(message: Message, settings: Settings, supabase: Client) ->
         await message.answer("Uso: /revoke_link <invite_link_name>")
         return
     invite_link_name = parts[1].strip()
+    if invite_link_name.startswith("https://t.me/"):
+        try:
+            await message.bot.revoke_chat_invite_link(
+                chat_id=settings.content_channel_id,
+                invite_link=invite_link_name,
+            )
+        except Exception as exc:
+            logger.exception("Could not revoke direct invite link")
+            await message.answer(f"Telegram error: {exc}")
+            return
+        await message.answer("Invite link revoked.")
+        return
+
     user = await asyncio.to_thread(get_user_by_invite_link_name, supabase, invite_link_name)
     invite_link = user.get("invite_link") if user else None
     if not user or not invite_link:
@@ -2133,10 +2332,15 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
 
 
 @router.chat_member()
-async def track_channel_membership(update: ChatMemberUpdated, settings: Settings, supabase: Client) -> None:
-    channel_matches = update.chat.id == settings.content_channel_id
-    if isinstance(settings.content_channel_id, str):
-        channel_matches = update.chat.username and f"@{update.chat.username}" == settings.content_channel_id
+async def track_channel_membership(update: ChatMemberUpdated, bot: Bot, settings: Settings, supabase: Client) -> None:
+    access_channel = await asyncio.to_thread(
+        find_access_channel_for_chat,
+        supabase,
+        settings,
+        update.chat.id,
+        update.chat.username,
+    )
+    channel_matches = bool(access_channel)
     if not channel_matches:
         return
 
@@ -2154,6 +2358,14 @@ async def track_channel_membership(update: ChatMemberUpdated, settings: Settings
         "last_seen_at": now,
     }
     if new_status in active_statuses and old_status not in active_statuses:
+        if await asyncio.to_thread(is_blacklisted_user, supabase, user.id):
+            await bot.ban_chat_member(chat_id=update.chat.id, user_id=user.id)
+            await bot.send_message(
+                settings.admin_chat_id,
+                f"Blacklisted user removed from {update.chat.title or update.chat.id}: {user.id}",
+            )
+            return
+
         payload.update(
             {
                 "joined_channel_at": now,
@@ -2162,6 +2374,37 @@ async def track_channel_membership(update: ChatMemberUpdated, settings: Settings
                 "invite_link_used": True,
             }
         )
+        invite_link_value = update.invite_link.invite_link if update.invite_link else None
+        if invite_link_value:
+            manual_link = await asyncio.to_thread(get_manual_invite_by_link, supabase, invite_link_value)
+            if manual_link:
+                await asyncio.to_thread(mark_manual_invite_used, supabase, invite_link_value, user.id)
+                await asyncio.to_thread(
+                    upsert_user_payload,
+                    supabase,
+                    user.id,
+                    payload,
+                )
+                await asyncio.to_thread(
+                    save_user_channel_access,
+                    supabase,
+                    user.id,
+                    access_channel,
+                    invite_link_value,
+                    manual_link.get("invite_link_name") or "",
+                    None,
+                )
+                username = f"@{user.username}" if user.username else "(sin username)"
+                await bot.send_message(
+                    settings.admin_chat_id,
+                    f"Manual invite used by {username} ({user.id})",
+                )
+                logger.info(
+                    "Manual invite link used telegram_id=%s channel=%s",
+                    user.id,
+                    channel_code(access_channel),
+                )
+                return
     elif new_status in left_statuses:
         existing = await asyncio.to_thread(get_registered_user, supabase, user.id)
         current = bool(existing and existing.get("payment_status") == "paid" and days_remaining(existing.get("expiry_date")) is not None and days_remaining(existing.get("expiry_date")) >= 0)
