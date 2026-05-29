@@ -1931,6 +1931,12 @@ async def send_invite(message: Message, settings: Settings, supabase: Client) ->
 
 @router.message(Command("manual_open_link"))
 async def manual_open_link(message: Message, settings: Settings, supabase: Client) -> None:
+    logger.info(
+        "Received /manual_open_link chat_id=%s from_user_id=%s text=%s",
+        message.chat.id,
+        message.from_user.id if message.from_user else None,
+        message.text,
+    )
     if not is_admin(message, settings):
         await reject_non_admin(message)
         return
@@ -1939,14 +1945,14 @@ async def manual_open_link(message: Message, settings: Settings, supabase: Clien
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
-        await message.answer("Uso: /manual_open_link CHANNEL_CODE")
+        await message.answer("Usage: /manual_open_link grupo")
         return
 
     requested_code = parts[1].strip()
     try:
         channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
         if not channel:
-            await message.answer("Canal no encontrado o inactivo.")
+            await message.answer("Channel not found.")
             return
         telegram_chat_id = channel_telegram_chat_id(channel)
         if not telegram_chat_id:
@@ -1968,11 +1974,7 @@ async def manual_open_link(message: Message, settings: Settings, supabase: Clien
             message.from_user.id,
             expires_at,
         )
-        await message.bot.send_message(
-            settings.admin_chat_id,
-            f"Manual open invite link\n{channel_label(channel)}:\n{invite_link}",
-        )
-        await message.answer("Link manual enviado al admin.")
+        await message.answer(f"Manual open invite link\n{channel_label(channel)}:\n{invite_link}")
     except Exception as exc:
         logger.exception("Could not create manual open invite link channel_code=%s", requested_code)
         await message.answer(f"No pude crear el link manual: {exc}")
