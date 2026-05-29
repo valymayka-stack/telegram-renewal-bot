@@ -210,6 +210,7 @@ create index if not exists manual_invite_links_channel_code_idx
 
 logger = logging.getLogger(__name__)
 router = Router()
+PAYMENT_CHANNEL_SELECTIONS: dict[tuple[int, int, int], set[str]] = {}
 
 
 @dataclass(frozen=True)
@@ -707,13 +708,17 @@ def selected_channel_keys_from_raw(raw: str | None) -> set[str]:
 
 
 def selected_channel_keys_for_approval(selected_channel_keys: set[str] | None) -> set[str]:
-    if not selected_channel_keys:
-        return {GRUPO_CHANNEL_KEY}
-    return set(selected_channel_keys)
+    return set(selected_channel_keys or set())
 
 
 def encode_selected_channel_keys(keys: set[str]) -> str:
     return ",".join(sorted(keys))
+
+
+def payment_selection_key(callback_query: CallbackQuery, telegram_id: int) -> tuple[int, int, int] | None:
+    if not callback_query.message:
+        return None
+    return (callback_query.message.chat.id, callback_query.message.message_id, telegram_id)
 
 
 def payment_receipt_file_url(file_id: Any) -> str | None:
@@ -922,33 +927,29 @@ def pending_payment_keyboard(
 ) -> InlineKeyboardMarkup:
     channels = get_access_channels(supabase, settings)
     selected = set(selected_keys or set())
-    if not selected:
-        selected.add(GRUPO_CHANNEL_KEY)
     channel_rows: list[list[InlineKeyboardButton]] = []
     for channel in channels:
         key = channel_code(channel)
         label = channel_label(channel)
         marker = "✅ " if key in selected else "⬜ "
-        selected_raw = encode_selected_channel_keys(selected)
         channel_rows.append(
             [
                 InlineKeyboardButton(
                     text=f"{marker}{label}",
-                    callback_data=f"payment:toggle:{telegram_id}:{selected_raw}:{key}",
+                    callback_data=f"payment:toggle:{telegram_id}:{key}",
                 )
             ]
         )
 
-    selected_raw = encode_selected_channel_keys(selected)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             *channel_rows,
             [
-                InlineKeyboardButton(text="Approve selected ✅", callback_data=f"payment:approve:{telegram_id}:{selected_raw}"),
+                InlineKeyboardButton(text="Approve selected ✅", callback_data=f"payment:approve:{telegram_id}"),
             ],
             [
-                InlineKeyboardButton(text="Reject ❌", callback_data=f"payment:reject:{telegram_id}:{selected_raw}"),
-                InlineKeyboardButton(text="Ask another receipt 🔁", callback_data=f"payment:ask_receipt:{telegram_id}:{selected_raw}"),
+                InlineKeyboardButton(text="Reject ❌", callback_data=f"payment:reject:{telegram_id}"),
+                InlineKeyboardButton(text="Ask another receipt 🔁", callback_data=f"payment:ask_receipt:{telegram_id}"),
             ],
         ]
     )
@@ -1732,7 +1733,7 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
                 supabase,
                 settings,
                 user.id,
-                {GRUPO_CHANNEL_KEY},
+                None,
             ),
         )
         logger.info("Payment receipt submitted telegram_id=%s", user.id)
@@ -2134,7 +2135,14 @@ async def approve_command(message: Message, settings: Settings, supabase: Client
         await message.answer("Uso: /approve <telegram_id>")
         return
     try:
-        result = await approve_payment(message.bot, supabase, settings, telegram_id, message.from_user.id)
+        result = await approve_payment(
+            message.bot,
+            supabase,
+            settings,
+            telegram_id,
+            message.from_user.id,
+            {GRUPO_CHANNEL_KEY},
+        )
         if result.get("duplicate"):
             await message.answer(f"Pago ya aprobado recientemente; reenvié link existente para {telegram_id}.")
         else:
@@ -2323,11 +2331,14 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
 
     try:
         if action == "toggle":
-            if len(parts) != 5:
+            if len(parts) not in {4, 5}:
                 await callback_query.answer("Acción inválida.", show_alert=True)
                 return
-            selected = selected_channel_keys_from_raw(parts[3])
-            key = parts[4]
+            key = parts[-1]
+            selection_key = payment_selection_key(callback_query, telegram_id)
+            selected = set(PAYMENT_CHANNEL_SELECTIONS.get(selection_key, set())) if selection_key else set()
+            if len(parts) == 5 and not selected:
+                selected = selected_channel_keys_from_raw(parts[3])
             channels = await asyncio.to_thread(get_access_channels, supabase, settings)
             available_keys = {channel_code(channel) for channel in channels}
             if key not in available_keys:
@@ -2337,6 +2348,8 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
                 selected.remove(key)
             else:
                 selected.add(key)
+            if selection_key:
+                PAYMENT_CHANNEL_SELECTIONS[selection_key] = selected
             await callback_query.message.edit_reply_markup(
                 reply_markup=await asyncio.to_thread(
                     pending_payment_keyboard,
@@ -2348,9 +2361,13 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             )
             await callback_query.answer("Selección actualizada")
         elif action == "approve":
-            selected = selected_channel_keys_from_raw(parts[3]) if len(parts) >= 4 else {GRUPO_CHANNEL_KEY}
+            selection_key = payment_selection_key(callback_query, telegram_id)
+            selected = set(PAYMENT_CHANNEL_SELECTIONS.get(selection_key, set())) if selection_key else set()
+            if len(parts) >= 4 and not selected:
+                selected = selected_channel_keys_from_raw(parts[3])
             if not selected:
-                selected = {GRUPO_CHANNEL_KEY}
+                await callback_query.answer("Select at least one channel before approving.", show_alert=True)
+                return
             result = await approve_payment(
                 callback_query.bot,
                 supabase,
@@ -2363,11 +2380,19 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
                 await callback_query.answer("Ya estaba aprobado; reenvié el link existente.", show_alert=True)
             else:
                 await callback_query.answer("Aprobado ✅")
+            if selection_key:
+                PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
         elif action == "reject":
             await reject_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
+            selection_key = payment_selection_key(callback_query, telegram_id)
+            if selection_key:
+                PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
             await callback_query.answer("Rechazado ❌")
         elif action == "ask_receipt":
             await ask_new_receipt(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
+            selection_key = payment_selection_key(callback_query, telegram_id)
+            if selection_key:
+                PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
             await callback_query.answer("Solicitud enviada 🔁")
         else:
             await callback_query.answer("Acción inválida.", show_alert=True)
@@ -2808,7 +2833,14 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
-            result = await approve_payment(bot, supabase, settings, telegram_id, next(iter(settings.admin_user_ids)))
+            result = await approve_payment(
+                bot,
+                supabase,
+                settings,
+                telegram_id,
+                next(iter(settings.admin_user_ids)),
+                {GRUPO_CHANNEL_KEY},
+            )
             if result.get("duplicate"):
                 return dashboard_redirect(filter, search, page, message=f"Payment was already approved recently; existing link resent for {telegram_id}.")
             return dashboard_redirect(filter, search, page, message=f"Payment approved for {telegram_id}.")
