@@ -2038,16 +2038,60 @@ async def revoke_link(message: Message, settings: Settings, supabase: Client) ->
         return
     invite_link_name = parts[1].strip()
     if invite_link_name.startswith("https://t.me/"):
-        try:
-            await message.bot.revoke_chat_invite_link(
-                chat_id=settings.content_channel_id,
-                invite_link=invite_link_name,
+        channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        for channel in channels:
+            telegram_chat_id = channel_telegram_chat_id(channel)
+            logger.info(
+                "Trying to revoke direct invite link channel=%s telegram_chat_id=%s",
+                channel,
+                telegram_chat_id,
             )
-        except Exception as exc:
-            logger.exception("Could not revoke direct invite link")
-            await message.answer(f"Telegram error: {exc}")
+            if not telegram_chat_id:
+                logger.warning("Skipping revoke attempt; channel missing telegram_chat_id: %s", channel)
+                continue
+            try:
+                await message.bot.revoke_chat_invite_link(
+                    chat_id=parse_stored_chat_id(telegram_chat_id),
+                    invite_link=invite_link_name,
+                )
+                logger.info("Direct invite link revoked from channel=%s", channel)
+                await message.answer(f"✅ Invite link revoked from {channel_label(channel)}")
+                return
+            except TelegramBadRequest as exc:
+                logger.warning(
+                    "Telegram error revoking direct invite link channel=%s error=%s",
+                    channel,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "Telegram error revoking direct invite link channel=%s error=%s",
+                    channel,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+        await message.answer("❌ Invite link not found in managed channels.")
+        return
+
+    try:
+        telegram_id = int(invite_link_name)
+    except ValueError:
+        telegram_id = None
+    if telegram_id is not None:
+        revoked = await revoke_invite_for_user(
+            message.bot,
+            supabase,
+            settings,
+            telegram_id,
+            "Latest invite link revoked for user by admin",
+            clear_link=True,
+        )
+        if not revoked:
+            await message.answer("No invite link found.")
             return
-        await message.answer("Invite link revoked.")
+        await message.answer(f"✅ Último link revocado para usuario {telegram_id}")
         return
 
     user = await asyncio.to_thread(get_user_by_invite_link_name, supabase, invite_link_name)
