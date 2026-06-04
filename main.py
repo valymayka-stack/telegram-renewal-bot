@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -677,6 +677,38 @@ def is_blacklisted_user(supabase: Client, telegram_id: int) -> bool:
         return bool(response.data)
     except Exception:
         return False
+
+
+def is_blacklisted(supabase: Client, telegram_id: int) -> bool:
+    try:
+        response = (
+            supabase.table("blacklist")
+            .select("telegram_id")
+            .eq("telegram_id", telegram_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(response.data)
+    except Exception:
+        logger.warning("Could not check blacklist telegram_id=%s", telegram_id, exc_info=True)
+        return False
+
+
+def should_ignore_blacklisted(supabase: Client, settings: Settings, telegram_id: int) -> bool:
+    if telegram_id in settings.admin_user_ids:
+        return False
+    return is_blacklisted(supabase, telegram_id)
+
+
+class BlacklistMiddleware(BaseMiddleware):
+    async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
+        user = getattr(event, "from_user", None)
+        settings = data.get("settings")
+        supabase = data.get("supabase")
+        if user and settings and supabase:
+            if await asyncio.to_thread(should_ignore_blacklisted, supabase, settings, user.id):
+                return None
+        return await handler(event, data)
 
 
 def ensure_grupo_access_channel(supabase: Client, settings: Settings) -> None:
@@ -1680,6 +1712,8 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         return
     if not message.from_user:
         return
+    if await asyncio.to_thread(should_ignore_blacklisted, supabase, settings, message.from_user.id):
+        return
 
     now = now_utc_iso()
     file_type = "photo" if message.photo else "document"
@@ -1911,6 +1945,67 @@ async def payment_history_command(message: Message, settings: Settings, supabase
         await message.answer(f"No pude consultar historial de pagos: {exc}")
         return
     await send_long_message(message, f"Historial de pagos para {telegram_id}:\n{format_payment_history_rows(rows)}")
+
+
+@router.message(Command("blacklist"))
+async def blacklist_user(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /blacklist <telegram_id>")
+        return
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("blacklist")
+            .upsert({"telegram_id": telegram_id}, on_conflict="telegram_id")
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("Could not blacklist telegram_id=%s", telegram_id)
+        await message.answer(f"No pude bloquear usuario: {exc}")
+        return
+    await message.answer(f"Usuario {telegram_id} agregado a blacklist.")
+
+
+@router.message(Command("unblacklist"))
+async def unblacklist_user(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /unblacklist <telegram_id>")
+        return
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("blacklist")
+            .delete()
+            .eq("telegram_id", telegram_id)
+            .execute()
+        )
+    except Exception as exc:
+        logger.exception("Could not unblacklist telegram_id=%s", telegram_id)
+        await message.answer(f"No pude desbloquear usuario: {exc}")
+        return
+    await message.answer(f"Usuario {telegram_id} removido de blacklist.")
+
+
+@router.message(Command("check_blacklist"))
+async def check_blacklist(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /check_blacklist <telegram_id>")
+        return
+    blocked = await asyncio.to_thread(is_blacklisted, supabase, telegram_id)
+    if blocked:
+        await message.answer(f"Usuario {telegram_id} está en blacklist.")
+    else:
+        await message.answer(f"Usuario {telegram_id} no está en blacklist.")
 
 
 @router.message(Command("send_invite"))
@@ -2292,7 +2387,14 @@ async def sync_schema(message: Message, settings: Settings, supabase: Client) ->
 
 
 @router.callback_query(F.data == CTA_CALLBACK_DATA)
-async def want_more_content(callback_query: CallbackQuery, supabase: Client) -> None:
+async def want_more_content(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if callback_query.from_user and await asyncio.to_thread(
+        should_ignore_blacklisted,
+        supabase,
+        settings,
+        callback_query.from_user.id,
+    ):
+        return
     try:
         upsert_cta_user(supabase, callback_query)
         await callback_query.answer("Listo 🔥")
@@ -2303,7 +2405,14 @@ async def want_more_content(callback_query: CallbackQuery, supabase: Client) -> 
 
 
 @router.callback_query(F.data == CONFIRM_SUBSCRIPTION_CALLBACK_DATA)
-async def confirm_subscription(callback_query: CallbackQuery, supabase: Client) -> None:
+async def confirm_subscription(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if callback_query.from_user and await asyncio.to_thread(
+        should_ignore_blacklisted,
+        supabase,
+        settings,
+        callback_query.from_user.id,
+    ):
+        return
     try:
         upsert_confirmed_subscription_user(supabase, callback_query)
         await callback_query.answer("Suscripción confirmada ✅")
@@ -2315,6 +2424,13 @@ async def confirm_subscription(callback_query: CallbackQuery, supabase: Client) 
 
 @router.callback_query(F.data.startswith("payment:"))
 async def payment_admin_callback(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if callback_query.from_user and await asyncio.to_thread(
+        should_ignore_blacklisted,
+        supabase,
+        settings,
+        callback_query.from_user.id,
+    ):
+        return
     if not is_admin_id(callback_query.from_user.id if callback_query.from_user else None, settings):
         await callback_query.answer("No autorizado.", show_alert=True)
         return
@@ -2569,6 +2685,9 @@ async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) 
 
 async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> None:
     dp = Dispatcher()
+    blacklist_middleware = BlacklistMiddleware()
+    router.message.outer_middleware(blacklist_middleware)
+    router.callback_query.outer_middleware(blacklist_middleware)
     dp.include_router(router)
 
     scheduler = AsyncIOScheduler(timezone=APP_TIMEZONE)
