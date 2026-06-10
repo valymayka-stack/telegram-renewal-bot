@@ -579,16 +579,41 @@ def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, 
 
 
 def get_access_channel_by_code(supabase: Client, requested_code: str) -> dict[str, Any] | None:
-    response = (
-        supabase.table("access_channels")
-        .select("*")
-        .eq("is_active", True)
-        .execute()
-    )
-    for channel in response.data or []:
-        if channel_code(channel) == requested_code:
-            return channel
+    requested_code = requested_code.strip()
+    if not requested_code:
+        return None
+    try:
+        response = (
+            supabase.table("access_channels")
+            .select("*")
+            .eq("code", requested_code)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return response.data[0]
+    except Exception:
+        logger.warning("Could not look up access channel by code=%s", requested_code, exc_info=True)
+    try:
+        response = (
+            supabase.table("access_channels")
+            .select("*")
+            .eq("is_active", True)
+            .execute()
+        )
+        for channel in response.data or []:
+            if str(channel.get("channel_key") or "") == requested_code:
+                return channel
+    except Exception:
+        logger.warning("Could not fall back to access channel_key=%s", requested_code, exc_info=True)
     return None
+
+
+def available_access_channel_codes(supabase: Client, settings: Settings) -> str:
+    channels = get_access_channels(supabase, settings)
+    codes = [channel_code(channel) for channel in channels if channel_code(channel)]
+    return ", ".join(codes) if codes else "none"
 
 
 def find_access_channel_for_chat(supabase: Client, settings: Settings, chat_id: int, username: str | None = None) -> dict[str, Any] | None:
@@ -2075,7 +2100,8 @@ async def manual_open_link(message: Message, settings: Settings, supabase: Clien
     try:
         channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
         if not channel:
-            await message.answer("Channel not found.")
+            available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+            await message.answer(f"Channel not found. Available active channel codes: {available_codes}")
             return
         telegram_chat_id = channel_telegram_chat_id(channel)
         if not telegram_chat_id:
@@ -2130,7 +2156,8 @@ async def send_manual_link(message: Message, settings: Settings, supabase: Clien
     try:
         channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
         if not channel:
-            await message.answer("Channel not found.")
+            available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+            await message.answer(f"Channel not found. Available active channel codes: {available_codes}")
             return
         telegram_chat_id = channel_telegram_chat_id(channel)
         if not telegram_chat_id:
@@ -2568,7 +2595,8 @@ async def ask_channel_selection(callback_query: CallbackQuery, settings: Setting
     channel_key = parts[2]
     channel = await asyncio.to_thread(get_access_channel_by_code, supabase, channel_key)
     if not channel:
-        await callback_query.answer("Canal no disponible.", show_alert=True)
+        available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+        await callback_query.answer(f"Canal no disponible. Disponibles: {available_codes}", show_alert=True)
         return
 
     label = channel_label(channel)
@@ -2600,7 +2628,8 @@ async def send_selected_channel_link(callback_query: CallbackQuery, settings: Se
     channel_key = parts[2]
     channel = await asyncio.to_thread(get_access_channel_by_code, supabase, channel_key)
     if not channel:
-        await callback_query.answer("Canal no disponible.", show_alert=True)
+        available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+        await callback_query.answer(f"Canal no disponible. Disponibles: {available_codes}", show_alert=True)
         return
     telegram_chat_id = channel_telegram_chat_id(channel)
     if not telegram_chat_id:
