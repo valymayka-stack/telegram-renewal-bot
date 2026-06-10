@@ -1577,6 +1577,33 @@ def build_confirm_subscription_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def build_channel_choice_keyboard(channels: list[dict[str, Any]], telegram_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=channel_label(channel),
+                    callback_data=f"ask_channel:{telegram_id}:{channel_code(channel)}",
+                )
+            ]
+            for channel in channels
+        ]
+    )
+
+
+def build_send_selected_channel_link_keyboard(telegram_id: int, channel_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Send link ✅",
+                    callback_data=f"send_channel_link:{telegram_id}:{channel_key}",
+                )
+            ]
+        ]
+    )
+
+
 def upsert_cta_user(supabase: Client, callback_query: CallbackQuery) -> None:
     if not callback_query.from_user:
         raise ValueError("Callback query has no from_user")
@@ -2145,6 +2172,38 @@ async def send_manual_link(message: Message, settings: Settings, supabase: Clien
     await message.answer(f"Link enviado a {telegram_id}.")
 
 
+@router.message(Command("ask_channel"))
+async def ask_channel(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /ask_channel <telegram_id>")
+        return
+
+    try:
+        channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        if not channels:
+            await message.answer("No hay canales activos configurados.")
+            return
+        await message.bot.send_message(
+            telegram_id,
+            "¿Qué contenido quieres recibir?",
+            reply_markup=build_channel_choice_keyboard(channels, telegram_id),
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM channel request telegram_id=%s", telegram_id, exc_info=True)
+        await message.answer("No pude enviar la solicitud. El usuario debe abrir el bot o escribirle primero.")
+        return
+    except Exception as exc:
+        logger.exception("Could not send channel request telegram_id=%s", telegram_id)
+        await message.answer(f"No pude enviar la solicitud: {exc}")
+        return
+
+    await message.answer(f"Solicitud enviada a {telegram_id}.")
+
+
 @router.message(Command("revoke_invite"))
 async def revoke_invite(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -2489,6 +2548,111 @@ async def confirm_subscription(callback_query: CallbackQuery, settings: Settings
         user_id = callback_query.from_user.id if callback_query.from_user else "unknown"
         logger.exception("Could not process subscription confirmation for user_id=%s", user_id)
         await callback_query.answer("Intenta de nuevo.", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("ask_channel:"))
+async def ask_channel_selection(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    parts = (callback_query.data or "").split(":", maxsplit=2)
+    if len(parts) != 3 or not callback_query.from_user:
+        await callback_query.answer("Solicitud inválida.", show_alert=True)
+        return
+    try:
+        telegram_id = int(parts[1])
+    except ValueError:
+        await callback_query.answer("Solicitud inválida.", show_alert=True)
+        return
+    if callback_query.from_user.id != telegram_id:
+        await callback_query.answer("Solicitud inválida.", show_alert=True)
+        return
+
+    channel_key = parts[2]
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, channel_key)
+    if not channel:
+        await callback_query.answer("Canal no disponible.", show_alert=True)
+        return
+
+    label = channel_label(channel)
+    code = channel_code(channel)
+    await callback_query.bot.send_message(
+        settings.admin_chat_id,
+        f"Usuario {telegram_id} seleccionó: {label} ({code})",
+        reply_markup=build_send_selected_channel_link_keyboard(telegram_id, code),
+    )
+    await callback_query.answer("Selección enviada ✅")
+
+
+@router.callback_query(F.data.startswith("send_channel_link:"))
+async def send_selected_channel_link(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not is_admin_id(callback_query.from_user.id if callback_query.from_user else None, settings):
+        await callback_query.answer("No autorizado.", show_alert=True)
+        return
+
+    parts = (callback_query.data or "").split(":", maxsplit=2)
+    if len(parts) != 3:
+        await callback_query.answer("Acción inválida.", show_alert=True)
+        return
+    try:
+        telegram_id = int(parts[1])
+    except ValueError:
+        await callback_query.answer("Usuario inválido.", show_alert=True)
+        return
+
+    channel_key = parts[2]
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, channel_key)
+    if not channel:
+        await callback_query.answer("Canal no disponible.", show_alert=True)
+        return
+    telegram_chat_id = channel_telegram_chat_id(channel)
+    if not telegram_chat_id:
+        logger.error("Selected channel missing telegram_chat_id: %s", channel)
+        await callback_query.answer("Canal sin telegram_chat_id.", show_alert=True)
+        return
+
+    label = channel_label(channel)
+    code = channel_code(channel)
+    try:
+        invite_link, invite_name = await create_one_use_invite_link_for_chat(
+            callback_query.bot,
+            parse_stored_chat_id(telegram_chat_id),
+            telegram_id,
+            code,
+        )
+    except Exception as exc:
+        logger.exception("Could not create selected channel invite telegram_id=%s channel_code=%s", telegram_id, code)
+        if callback_query.message:
+            await callback_query.message.edit_text(f"No pude generar el link para {telegram_id}: {exc}")
+        await callback_query.answer("No pude generar el link.", show_alert=True)
+        return
+
+    try:
+        await callback_query.bot.send_message(
+            telegram_id,
+            f"Aquí está tu link de acceso a {label}: {invite_link}",
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM selected channel invite telegram_id=%s", telegram_id, exc_info=True)
+        if callback_query.message:
+            await callback_query.message.edit_text(
+                "No pude enviar el link. El usuario debe abrir el bot o escribirle primero."
+            )
+        await callback_query.answer("No pude enviar el link.", show_alert=True)
+        return
+
+    expires_at = None
+    if channel_has_expiry(channel):
+        expires_at = (datetime.now(APP_TIMEZONE).date() + timedelta(days=30)).isoformat()
+    await asyncio.to_thread(
+        save_user_channel_access,
+        supabase,
+        telegram_id,
+        channel,
+        invite_link,
+        invite_name,
+        expires_at,
+    )
+    if callback_query.message:
+        await callback_query.message.edit_text(f"Link enviado a {telegram_id} para {label} ({code}).")
+    await callback_query.answer("Link enviado ✅")
 
 
 @router.callback_query(F.data.startswith("payment:"))
