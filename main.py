@@ -2076,6 +2076,75 @@ async def manual_open_link(message: Message, settings: Settings, supabase: Clien
         await message.answer(f"No pude crear el link manual: {exc}")
 
 
+@router.message(Command("send_manual_link"))
+async def send_manual_link(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    if not message.from_user:
+        await message.answer("No pude identificar al admin.")
+        return
+
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer("Uso: /send_manual_link <telegram_id> <channel_code>")
+        return
+    try:
+        telegram_id = int(parts[1])
+    except ValueError:
+        await message.answer("telegram_id inválido.")
+        return
+
+    requested_code = parts[2].strip()
+    if not requested_code:
+        await message.answer("Uso: /send_manual_link <telegram_id> <channel_code>")
+        return
+
+    try:
+        channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
+        if not channel:
+            await message.answer("Channel not found.")
+            return
+        telegram_chat_id = channel_telegram_chat_id(channel)
+        if not telegram_chat_id:
+            logger.error("Manual send channel missing telegram_chat_id: %s", channel)
+            await message.answer(f"Canal {requested_code} no tiene telegram_chat_id configurado.")
+            return
+
+        invite_link, invite_name, expires_at = await create_manual_open_invite_link(
+            message.bot,
+            parse_stored_chat_id(telegram_chat_id),
+            channel_code(channel),
+        )
+        await asyncio.to_thread(
+            save_manual_invite_link,
+            supabase,
+            channel,
+            invite_link,
+            invite_name,
+            message.from_user.id,
+            expires_at,
+        )
+        await message.bot.send_message(
+            telegram_id,
+            f"Aquí está tu link de acceso a {channel_label(channel)}: {invite_link}",
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM manual invite link telegram_id=%s", telegram_id, exc_info=True)
+        await message.answer("No pude enviar el link. El usuario debe abrir el bot o escribirle primero.")
+        return
+    except Exception as exc:
+        logger.exception(
+            "Could not create/send manual invite link telegram_id=%s channel_code=%s",
+            telegram_id,
+            requested_code,
+        )
+        await message.answer(f"No pude generar/enviar el link: {exc}")
+        return
+
+    await message.answer(f"Link enviado a {telegram_id}.")
+
+
 @router.message(Command("revoke_invite"))
 async def revoke_invite(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
