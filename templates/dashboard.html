@@ -438,6 +438,9 @@
                       <form method="post" action="/dashboard/users/{{ user.telegram_id }}/renew/current-expiry?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
                         <button class="action primary" type="submit">Renew +30 from expiry</button>
                       </form>
+                      <form method="post" action="/dashboard/users/{{ user.telegram_id }}/confirm-renewal?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
+                        <button class="action" type="submit">Confirm renewal</button>
+                      </form>
                       <form method="post" action="/dashboard/users/{{ user.telegram_id }}/paid?filter={{ active_filter }}&search={{ search }}&page={{ page }}">
                         <button class="action" type="submit">Mark paid</button>
                       </form>
