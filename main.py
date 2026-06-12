@@ -1008,6 +1008,12 @@ def pending_payment_keyboard(
                 InlineKeyboardButton(text="Reject ❌", callback_data=f"payment:reject:{telegram_id}"),
                 InlineKeyboardButton(text="Ask another receipt 🔁", callback_data=f"payment:ask_receipt:{telegram_id}"),
             ],
+            [
+                InlineKeyboardButton(
+                    text="Confirm renewal ✅",
+                    callback_data=f"payment:confirm_renewal:{telegram_id}",
+                ),
+            ],
         ]
     )
 
@@ -2800,6 +2806,15 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             if selection_key:
                 PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
             await callback_query.answer("Solicitud enviada 🔁")
+        elif action == "confirm_renewal":
+            sent = await send_renewal_confirmation(callback_query.bot, telegram_id)
+            if sent:
+                await callback_query.answer("Confirmación enviada ✅")
+            else:
+                await callback_query.answer(
+                    "No pude enviar la confirmación. El usuario debe abrir el bot o escribirle primero.",
+                    show_alert=True,
+                )
         else:
             await callback_query.answer("Acción inválida.", show_alert=True)
             return
