@@ -1226,6 +1226,18 @@ async def send_channel_invites_to_user(bot: Bot, telegram_id: int, channel_links
         return False
 
 
+async def send_renewal_confirmation(bot: Bot, telegram_id: int) -> bool:
+    try:
+        await bot.send_message(
+            telegram_id,
+            "Tu membresía ha sido renovada exitosamente. Gracias 💕",
+        )
+        return True
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM renewal confirmation telegram_id=%s", telegram_id, exc_info=True)
+        return False
+
+
 async def approve_payment(
     bot: Bot,
     supabase: Client,
@@ -1997,6 +2009,22 @@ async def payment_history_command(message: Message, settings: Settings, supabase
         await message.answer(f"No pude consultar historial de pagos: {exc}")
         return
     await send_long_message(message, f"Historial de pagos para {telegram_id}:\n{format_payment_history_rows(rows)}")
+
+
+@router.message(Command("confirm_renewal"))
+async def confirm_renewal(message: Message, settings: Settings) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /confirm_renewal <telegram_id>")
+        return
+    sent = await send_renewal_confirmation(message.bot, telegram_id)
+    if sent:
+        await message.answer(f"Confirmación de renovación enviada a {telegram_id}.")
+    else:
+        await message.answer("No pude enviar la confirmación. El usuario debe abrir el bot o escribirle primero.")
 
 
 @router.message(Command("blacklist"))
@@ -3157,6 +3185,31 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         except Exception as exc:
             logger.exception("Could not renew from current expiry for telegram_id=%s", telegram_id)
             return dashboard_redirect(filter, search, page, error=f"Could not renew from current expiry_date: {exc}")
+
+    @app.post("/dashboard/users/{telegram_id}/confirm-renewal", response_model=None)
+    async def dashboard_confirm_renewal(
+        telegram_id: int,
+        request: Request,
+        filter: str = "all",
+        search: str = "",
+        page: int = 1,
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        sent = await send_renewal_confirmation(bot, telegram_id)
+        if sent:
+            return dashboard_redirect(
+                filter,
+                search,
+                page,
+                message=f"Confirmación de renovación enviada a {telegram_id}.",
+            )
+        return dashboard_redirect(
+            filter,
+            search,
+            page,
+            error="No pude enviar la confirmación. El usuario debe abrir el bot o escribirle primero.",
+        )
 
     @app.post("/dashboard/users/{telegram_id}/paid", response_model=None)
     async def dashboard_mark_paid(
