@@ -985,18 +985,22 @@ def pending_payment_keyboard(
     channels = get_access_channels(supabase, settings)
     selected = set(selected_keys or set())
     channel_rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
     for channel in channels:
         key = channel_code(channel)
         label = channel_label(channel)
         marker = "✅ " if key in selected else "⬜ "
-        channel_rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{marker}{label}",
-                    callback_data=f"payment:toggle:{telegram_id}:{key}",
-                )
-            ]
+        current_row.append(
+            InlineKeyboardButton(
+                text=f"{marker}{label}",
+                callback_data=f"payment:toggle:{telegram_id}:{key}",
+            )
         )
+        if len(current_row) == 3:
+            channel_rows.append(current_row)
+            current_row = []
+    if current_row:
+        channel_rows.append(current_row)
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
