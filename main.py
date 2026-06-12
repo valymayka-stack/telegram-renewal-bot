@@ -2809,8 +2809,16 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
         elif action == "confirm_renewal":
             sent = await send_renewal_confirmation(callback_query.bot, telegram_id)
             if sent:
+                await callback_query.bot.send_message(
+                    settings.admin_chat_id,
+                    f"Renovación confirmada para {telegram_id} ✅",
+                )
                 await callback_query.answer("Confirmación enviada ✅")
             else:
+                await callback_query.bot.send_message(
+                    settings.admin_chat_id,
+                    f"No pude confirmar renovación para {telegram_id}. El usuario debe abrir el bot o escribirle primero.",
+                )
                 await callback_query.answer(
                     "No pude enviar la confirmación. El usuario debe abrir el bot o escribirle primero.",
                     show_alert=True,
