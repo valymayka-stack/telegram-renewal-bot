@@ -2037,6 +2037,31 @@ async def confirm_renewal(message: Message, settings: Settings) -> None:
         await message.answer("No pude enviar la confirmación. El usuario debe abrir el bot o escribirle primero.")
 
 
+@router.message(Command("contact_admin"))
+async def contact_admin(message: Message, settings: Settings) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /contact_admin <telegram_id>")
+        return
+    try:
+        await message.bot.send_message(
+            telegram_id,
+            "Hola 👋\n\n"
+            "No puedo validar tu pago por el momento.\n\n"
+            "Por favor contacta a @chivi01 para continuar con tu solicitud.\n\n"
+            "Gracias 💕",
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM contact admin message telegram_id=%s", telegram_id, exc_info=True)
+        await message.answer("No pude enviar el mensaje. El usuario debe abrir el bot o escribirle primero.")
+        return
+
+    await message.answer(f"Mensaje de contacto enviado a {telegram_id} ✅")
+
+
 @router.message(Command("blacklist"))
 async def blacklist_user(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
