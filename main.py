@@ -1495,6 +1495,22 @@ def active_users_expiring_next_7_days(supabase: Client) -> list[dict[str, Any]]:
     return response.data or []
 
 
+def renewal_broadcast_text(expiry_date: Any) -> str:
+    expiry = str(expiry_date or "-")
+    return (
+        "Hola bebé 💕\n\n"
+        f"Solo paso a recordarte que tu membresía vence el {expiry}. "
+        "Te aviso con anticipación para evitar que se te junte al final. ✨\n\n"
+        "En caso de no recibir tu renovación antes de esa fecha, tu acceso al canal será removido "
+        "automáticamente al día siguiente.\n\n"
+        f"Además, si realizas tu renovación a más tardar el {expiry}, recibirás un pequeño set de regalo "
+        "como agradecimiento. 🎁💖\n\n"
+        "Si tienes alguna situación especial o necesitas datos para transferencia o un link de pago con "
+        "tarjeta, házmelo saber y con gusto te los envío.\n\n"
+        "¡Gracias, bebé! 😘"
+    )
+
+
 async def remove_user_from_channel(
     bot: Bot,
     supabase: Client,
@@ -2598,6 +2614,78 @@ async def renewal_preview(message: Message, settings: Settings, supabase: Client
     if not rows:
         lines.append("No hay usuarios activos expirando en los próximos 7 días.")
     await send_long_message(message, "\n\n".join(lines))
+
+
+@router.message(Command("renewal_message_preview"))
+async def renewal_message_preview(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        rows = await asyncio.to_thread(active_users_expiring_next_7_days, supabase)
+    except Exception as exc:
+        logger.exception("Could not fetch renewal message preview users")
+        await message.answer(f"No pude consultar renovaciones próximas: {exc}")
+        return
+
+    lines = [f"Usuarios activos para recordatorio de renovación: {len(rows)}"]
+    for row in rows:
+        lines.append(
+            "\n".join(
+                [
+                    f"telegram_id: {row.get('telegram_id') or '-'}",
+                    f"username: {row.get('username') or '-'}",
+                    f"first_name: {row.get('first_name') or '-'}",
+                    f"expiry_date: {row.get('expiry_date') or '-'}",
+                    f"days_remaining: {days_remaining(row.get('expiry_date'))}",
+                ]
+            )
+        )
+    if not rows:
+        lines.append("No hay usuarios activos expirando en los próximos 7 días.")
+    await send_long_message(message, "\n\n".join(lines))
+
+
+@router.message(Command("renewal_message_confirm"))
+async def renewal_message_confirm(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        rows = await asyncio.to_thread(active_users_expiring_next_7_days, supabase)
+    except Exception as exc:
+        logger.exception("Could not fetch renewal message users")
+        await message.answer(f"No pude consultar renovaciones próximas: {exc}")
+        return
+
+    sent = 0
+    failed_ids: list[str] = []
+    for row in rows:
+        telegram_id = row.get("telegram_id")
+        if telegram_id is None:
+            continue
+        try:
+            await message.bot.send_message(
+                int(telegram_id),
+                renewal_broadcast_text(row.get("expiry_date")),
+            )
+            sent += 1
+        except (TelegramBadRequest, TelegramForbiddenError):
+            logger.warning("Could not DM renewal message telegram_id=%s", telegram_id, exc_info=True)
+            failed_ids.append(str(telegram_id))
+        except Exception:
+            logger.exception("Unexpected renewal message failure telegram_id=%s", telegram_id)
+            failed_ids.append(str(telegram_id))
+
+    lines = [
+        f"Total users found: {len(rows)}",
+        f"Messages sent: {sent}",
+        f"Messages failed: {len(failed_ids)}",
+        f"Failed telegram_ids: {', '.join(failed_ids) if failed_ids else '-'}",
+    ]
+    await send_long_message(message, "\n".join(lines))
 
 
 @router.message(Command("remove_expired_preview"))
