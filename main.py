@@ -1477,6 +1477,24 @@ def expired_active_users(supabase: Client) -> list[dict[str, Any]]:
     return response.data or []
 
 
+def active_users_expiring_next_7_days(supabase: Client) -> list[dict[str, Any]]:
+    today = datetime.now(APP_TIMEZONE).date()
+    soon = today + timedelta(days=7)
+    response = (
+        supabase.table("telegram_users")
+        .select(
+            "telegram_id,username,first_name,expiry_date,"
+            "renewal_notice_7d_sent_at,renewal_notice_3d_sent_at,renewal_notice_1d_sent_at"
+        )
+        .eq("status", "active")
+        .gte("expiry_date", today.isoformat())
+        .lte("expiry_date", soon.isoformat())
+        .order("expiry_date")
+        .execute()
+    )
+    return response.data or []
+
+
 async def remove_user_from_channel(
     bot: Bot,
     supabase: Client,
@@ -2546,6 +2564,40 @@ async def expired(message: Message, settings: Settings, supabase: Client) -> Non
     if not rows:
         lines.append("No hay usuarios activos expirados.")
     await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("renewal_preview"))
+async def renewal_preview(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        rows = await asyncio.to_thread(active_users_expiring_next_7_days, supabase)
+    except Exception as exc:
+        logger.exception("Could not fetch renewal preview users")
+        await message.answer(f"No pude consultar renovaciones próximas: {exc}")
+        return
+
+    lines = [f"Usuarios activos que expiran en los próximos 7 días: {len(rows)}"]
+    for row in rows:
+        lines.append(
+            "\n".join(
+                [
+                    f"telegram_id: {row.get('telegram_id') or '-'}",
+                    f"username: {row.get('username') or '-'}",
+                    f"first_name: {row.get('first_name') or '-'}",
+                    f"expiry_date: {row.get('expiry_date') or '-'}",
+                    f"days_remaining: {days_remaining(row.get('expiry_date'))}",
+                    f"renewal_notice_7d_sent_at: {row.get('renewal_notice_7d_sent_at') or '-'}",
+                    f"renewal_notice_3d_sent_at: {row.get('renewal_notice_3d_sent_at') or '-'}",
+                    f"renewal_notice_1d_sent_at: {row.get('renewal_notice_1d_sent_at') or '-'}",
+                ]
+            )
+        )
+    if not rows:
+        lines.append("No hay usuarios activos expirando en los próximos 7 días.")
+    await send_long_message(message, "\n\n".join(lines))
 
 
 @router.message(Command("remove_expired_preview"))
