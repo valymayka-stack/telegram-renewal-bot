@@ -206,6 +206,17 @@ create index if not exists manual_invite_links_invite_link_idx
   on public.manual_invite_links (invite_link);
 create index if not exists manual_invite_links_channel_code_idx
   on public.manual_invite_links (channel_code);
+create table if not exists public.renewal_message_recipients (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  username text,
+  first_name text,
+  sent_at timestamptz default now()
+);
+create index if not exists renewal_message_recipients_sent_at_idx
+  on public.renewal_message_recipients (sent_at desc);
+create index if not exists renewal_message_recipients_telegram_id_idx
+  on public.renewal_message_recipients (telegram_id);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -1511,6 +1522,35 @@ def renewal_broadcast_text(expiry_date: Any) -> str:
     )
 
 
+def insert_renewal_message_recipient(supabase: Client, row: dict[str, Any]) -> None:
+    try:
+        supabase.table("renewal_message_recipients").insert(
+            {
+                "telegram_id": row.get("telegram_id"),
+                "username": row.get("username"),
+                "first_name": row.get("first_name"),
+                "sent_at": now_utc_iso(),
+            }
+        ).execute()
+    except Exception:
+        logger.warning(
+            "Could not store renewal message recipient telegram_id=%s",
+            row.get("telegram_id"),
+            exc_info=True,
+        )
+
+
+def latest_renewal_message_recipients(supabase: Client, limit: int = 20) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("renewal_message_recipients")
+        .select("telegram_id,username,first_name,sent_at")
+        .order("sent_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return response.data or []
+
+
 async def remove_user_from_channel(
     bot: Bot,
     supabase: Client,
@@ -2595,19 +2635,32 @@ async def renewal_preview(message: Message, settings: Settings, supabase: Client
         await message.answer(f"No pude consultar renovaciones próximas: {exc}")
         return
 
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("expiry_date") or ""),
+            str(row.get("first_name") or "").lower(),
+            str(row.get("telegram_id") or ""),
+        ),
+    )
     lines = [f"Usuarios activos que expiran en los próximos 7 días: {len(rows)}"]
+    current_expiry = None
     for row in rows:
+        expiry = row.get("expiry_date") or "-"
+        if expiry != current_expiry:
+            lines.append(f"📅 {expiry}")
+            current_expiry = expiry
         lines.append(
             "\n".join(
                 [
-                    f"telegram_id: {row.get('telegram_id') or '-'}",
-                    f"username: {row.get('username') or '-'}",
-                    f"first_name: {row.get('first_name') or '-'}",
-                    f"expiry_date: {row.get('expiry_date') or '-'}",
-                    f"days_remaining: {days_remaining(row.get('expiry_date'))}",
-                    f"renewal_notice_7d_sent_at: {row.get('renewal_notice_7d_sent_at') or '-'}",
-                    f"renewal_notice_3d_sent_at: {row.get('renewal_notice_3d_sent_at') or '-'}",
-                    f"renewal_notice_1d_sent_at: {row.get('renewal_notice_1d_sent_at') or '-'}",
+                    f"- telegram_id: {row.get('telegram_id') or '-'}",
+                    f"  username: {row.get('username') or '-'}",
+                    f"  first_name: {row.get('first_name') or '-'}",
+                    f"  expiry_date: {expiry}",
+                    f"  days_remaining: {days_remaining(row.get('expiry_date'))}",
+                    f"  renewal_notice_7d_sent_at: {row.get('renewal_notice_7d_sent_at') or '-'}",
+                    f"  renewal_notice_3d_sent_at: {row.get('renewal_notice_3d_sent_at') or '-'}",
+                    f"  renewal_notice_1d_sent_at: {row.get('renewal_notice_1d_sent_at') or '-'}",
                 ]
             )
         )
@@ -2671,6 +2724,7 @@ async def renewal_message_confirm(message: Message, settings: Settings, supabase
                 int(telegram_id),
                 renewal_broadcast_text(row.get("expiry_date")),
             )
+            await asyncio.to_thread(insert_renewal_message_recipient, supabase, row)
             sent += 1
         except (TelegramBadRequest, TelegramForbiddenError):
             logger.warning("Could not DM renewal message telegram_id=%s", telegram_id, exc_info=True)
@@ -2686,6 +2740,36 @@ async def renewal_message_confirm(message: Message, settings: Settings, supabase
         f"Failed telegram_ids: {', '.join(failed_ids) if failed_ids else '-'}",
     ]
     await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("renewal_message_status"))
+async def renewal_message_status(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        rows = await asyncio.to_thread(latest_renewal_message_recipients, supabase)
+    except Exception as exc:
+        logger.exception("Could not fetch renewal message status")
+        await message.answer(f"No pude consultar últimos recordatorios enviados: {exc}")
+        return
+
+    lines = [f"Últimos renewal_message_confirm exitosos: {len(rows)}"]
+    for row in rows:
+        lines.append(
+            "\n".join(
+                [
+                    f"telegram_id: {row.get('telegram_id') or '-'}",
+                    f"username: {row.get('username') or '-'}",
+                    f"first_name: {row.get('first_name') or '-'}",
+                    f"sent_at: {format_local_datetime(row.get('sent_at'))}",
+                ]
+            )
+        )
+    if not rows:
+        lines.append("No hay envíos exitosos registrados todavía.")
+    await send_long_message(message, "\n\n".join(lines))
 
 
 @router.message(Command("remove_expired_preview"))
