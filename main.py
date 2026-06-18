@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import secrets
+import shlex
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
@@ -38,6 +39,43 @@ CONFIRM_SUBSCRIPTION_BUTTON_TEXT = "CONFIRMAR SUSCRIPCIÓN ✅"
 CONFIRM_SUBSCRIPTION_CALLBACK_DATA = "confirm_subscription_v1"
 CONFIRMATION_CAMPAIGN = "subscription_confirmation_v1"
 CONFIRMATION_SOURCE = "confirm_subscription_button"
+TIRADA_CAMPAIGN_TEXT = (
+    "🎯 DINÁMICA ESPECIAL — TIRADA MUNDIAL 🇲🇽\n\n"
+    "💰 Costo:\n"
+    "$40 MXN por tirada\n\n"
+    "🏆 Premios posibles:\n"
+    "🎁 Descuentos en renovación\n"
+    "📸 Fotos especiales\n"
+    "🎙️ Nota de voz sensual\n"
+    "🎬 Clips sorpresa\n"
+    "⭐ Renovación gratis\n\n"
+    "¿Cómo participar?\n\n"
+    "1️⃣ Realiza tu pago\n"
+    "2️⃣ Envía tu comprobante por privado al bot\n"
+    "3️⃣ Validamos tu pago\n"
+    "4️⃣ El bot revela tu premio 🎯\n\n"
+    "💕 ¡Mucha suerte, bebé!"
+)
+PREDICTION_MEX_KOREA_GAME_CODE = "mex_korea"
+PREDICTION_MEX_KOREA_SCORES = [
+    "México 1-0 Korea",
+    "México 2-0 Korea",
+    "México 2-1 Korea",
+    "México 3-1 Korea",
+    "México 1-1 Korea",
+    "México 0-0 Korea",
+    "México 3-0 Korea",
+    "México 0-1 Korea",
+    "México 1-2 Korea",
+    "México 2-2 Korea",
+]
+PREDICTION_GAMES = {
+    PREDICTION_MEX_KOREA_GAME_CODE: PREDICTION_MEX_KOREA_SCORES,
+}
+PREDICTION_MEX_KOREA_TEXT = (
+    "⚽ Pronóstico México vs Korea\n\n"
+    "Elige tu marcador. Solo cuenta un pronóstico por usuario; si cambias de opción, se actualiza tu elección."
+)
 GRUPO_CHANNEL_KEY = "grupo"
 GRUPO_CHANNEL_LABEL = "Grupo"
 LADY_CHANNEL_KEY = "lady_in_red"
@@ -217,6 +255,25 @@ create index if not exists renewal_message_recipients_sent_at_idx
   on public.renewal_message_recipients (sent_at desc);
 create index if not exists renewal_message_recipients_telegram_id_idx
   on public.renewal_message_recipients (telegram_id);
+create table if not exists public.prediction_votes (
+  id bigserial primary key,
+  game_code text not null,
+  telegram_id bigint not null,
+  username text,
+  first_name text,
+  selected_score text not null,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique (game_code, telegram_id)
+);
+create index if not exists prediction_votes_game_code_idx
+  on public.prediction_votes (game_code);
+create index if not exists prediction_votes_selected_score_idx
+  on public.prediction_votes (game_code, selected_score);
+create index if not exists prediction_votes_updated_at_idx
+  on public.prediction_votes (updated_at desc);
+create unique index if not exists prediction_votes_game_telegram_unique_idx
+  on public.prediction_votes (game_code, telegram_id);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -1551,6 +1608,86 @@ def latest_renewal_message_recipients(supabase: Client, limit: int = 20) -> list
     return response.data or []
 
 
+def prediction_scores_for_game(game_code: str) -> list[str]:
+    return PREDICTION_GAMES.get(game_code, [])
+
+
+def build_prediction_keyboard(game_code: str) -> InlineKeyboardMarkup:
+    scores = prediction_scores_for_game(game_code)
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for index, score in enumerate(scores):
+        current_row.append(
+            InlineKeyboardButton(
+                text=score,
+                callback_data=f"prediction:{game_code}:{index}",
+            )
+        )
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def upsert_prediction_vote(supabase: Client, game_code: str, callback_query: CallbackQuery, selected_score: str) -> None:
+    if not callback_query.from_user:
+        raise ValueError("Callback query has no from_user")
+    user = callback_query.from_user
+    existing = (
+        supabase.table("prediction_votes")
+        .select("id")
+        .eq("game_code", game_code)
+        .eq("telegram_id", user.id)
+        .limit(1)
+        .execute()
+    )
+    payload = {
+        "game_code": game_code,
+        "telegram_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "selected_score": selected_score,
+        "updated_at": now_utc_iso(),
+    }
+    if existing.data:
+        (
+            supabase.table("prediction_votes")
+            .update(payload)
+            .eq("game_code", game_code)
+            .eq("telegram_id", user.id)
+            .execute()
+        )
+    else:
+        payload["created_at"] = now_utc_iso()
+        supabase.table("prediction_votes").insert(payload).execute()
+
+
+def prediction_votes_for_game(supabase: Client, game_code: str) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("prediction_votes")
+        .select("*")
+        .eq("game_code", game_code)
+        .order("selected_score")
+        .order("first_name")
+        .execute()
+    )
+    return response.data or []
+
+
+def prediction_winner_rows(supabase: Client, game_code: str, score: str) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("prediction_votes")
+        .select("*")
+        .eq("game_code", game_code)
+        .eq("selected_score", score)
+        .order("first_name")
+        .execute()
+    )
+    return response.data or []
+
+
 async def remove_user_from_channel(
     bot: Bot,
     supabase: Client,
@@ -1852,6 +1989,46 @@ async def send_confirm_subscription(message: Message, settings: Settings) -> Non
         return
 
     await message.answer("Mensaje de confirmación enviado al canal.")
+
+
+@router.message(Command("send_tirada_campaign"))
+async def send_tirada_campaign(message: Message, settings: Settings) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        await message.bot.send_message(
+            chat_id=settings.content_channel_id,
+            text=TIRADA_CAMPAIGN_TEXT,
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        logger.exception("Could not send Tirada Mundial campaign")
+        await message.answer(f"No pude enviar la campaña de Tirada Mundial: {exc}")
+        return
+
+    await message.answer("Campaña de Tirada Mundial enviada al canal.")
+
+
+@router.message(F.text.startswith("/send_mex_korea_prediction"))
+@router.message(Command("send_mex_korea_prediction"))
+async def send_mex_korea_prediction(message: Message, settings: Settings) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+
+    try:
+        await message.bot.send_message(
+            chat_id=settings.content_channel_id,
+            text=PREDICTION_MEX_KOREA_TEXT,
+            reply_markup=build_prediction_keyboard(PREDICTION_MEX_KOREA_GAME_CODE),
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        logger.exception("Could not send Mexico Korea prediction")
+        await message.answer(f"No pude enviar el pronóstico: {exc}")
+        return
+
+    await message.answer("Pronóstico México vs Korea enviado al canal.")
 
 
 @router.message(F.chat.type == "private", (F.photo | F.document))
@@ -2772,6 +2949,129 @@ async def renewal_message_status(message: Message, settings: Settings, supabase:
     await send_long_message(message, "\n\n".join(lines))
 
 
+@router.message(Command("prediction_results"))
+async def prediction_results(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer("Uso: /prediction_results mex_korea")
+        return
+    game_code = parts[1].strip()
+    scores = prediction_scores_for_game(game_code)
+    if not scores:
+        await message.answer("Juego no encontrado.")
+        return
+    rows = await asyncio.to_thread(prediction_votes_for_game, supabase, game_code)
+    grouped: dict[str, list[dict[str, Any]]] = {score: [] for score in scores}
+    for row in rows:
+        grouped.setdefault(str(row.get("selected_score") or "-"), []).append(row)
+
+    lines = [f"Resultados de pronóstico {game_code}: {len(rows)} votos"]
+    for score, score_rows in grouped.items():
+        lines.append(f"\n{score}: {len(score_rows)}")
+        for row in score_rows:
+            username = f"@{row.get('username')}" if row.get("username") else "-"
+            lines.append(f"- {row.get('telegram_id')} | {username} | {row.get('first_name') or '-'}")
+    await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("prediction_winners"))
+async def prediction_winners(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    try:
+        parts = shlex.split(message.text or "")
+    except ValueError:
+        await message.answer('Uso: /prediction_winners mex_korea "México 2-1 Korea"')
+        return
+    if len(parts) < 3:
+        await message.answer('Uso: /prediction_winners mex_korea "México 2-1 Korea"')
+        return
+    game_code = parts[1]
+    score = " ".join(parts[2:])
+    if not prediction_scores_for_game(game_code):
+        await message.answer("Juego no encontrado.")
+        return
+    rows = await asyncio.to_thread(prediction_winner_rows, supabase, game_code, score)
+    lines = [f"Ganadores {game_code} | {score}: {len(rows)}"]
+    for row in rows:
+        username = f"@{row.get('username')}" if row.get("username") else "-"
+        lines.append(f"- {row.get('telegram_id')} | {username} | {row.get('first_name') or '-'}")
+    if not rows:
+        lines.append("Sin usuarios con ese pronóstico.")
+    await send_long_message(message, "\n".join(lines))
+
+
+@router.message(Command("send_prediction_winners_link"))
+async def send_prediction_winners_link(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    try:
+        parts = shlex.split(message.text or "")
+    except ValueError:
+        await message.answer('Uso: /send_prediction_winners_link mex_korea "México 2-1 Korea" regalo_renovacion')
+        return
+    if len(parts) < 4:
+        await message.answer('Uso: /send_prediction_winners_link mex_korea "México 2-1 Korea" regalo_renovacion')
+        return
+
+    game_code = parts[1]
+    channel_code_value = parts[-1]
+    score = " ".join(parts[2:-1])
+    if not prediction_scores_for_game(game_code):
+        await message.answer("Juego no encontrado.")
+        return
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, channel_code_value)
+    if not channel:
+        available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+        await message.answer(f"Channel not found. Available active channel codes: {available_codes}")
+        return
+    telegram_chat_id = channel_telegram_chat_id(channel)
+    if not telegram_chat_id:
+        await message.answer(f"Canal {channel_code_value} no tiene telegram_chat_id configurado.")
+        return
+
+    rows = await asyncio.to_thread(prediction_winner_rows, supabase, game_code, score)
+    sent = 0
+    failed_ids: list[str] = []
+    chat_id = parse_stored_chat_id(telegram_chat_id)
+    for row in rows:
+        telegram_id = int(row["telegram_id"])
+        try:
+            invite_link, _invite_name = await create_one_use_invite_link_for_chat(
+                message.bot,
+                chat_id,
+                telegram_id,
+                channel_code(channel),
+            )
+            await message.bot.send_message(
+                telegram_id,
+                f"Ganaste el pronóstico 🎉\n\nAquí está tu link de acceso: {invite_link}",
+            )
+            sent += 1
+        except Exception:
+            logger.exception("Could not send prediction winner link telegram_id=%s", telegram_id)
+            failed_ids.append(str(telegram_id))
+
+    summary = "\n".join(
+        [
+            f"Prediction winners link summary for {game_code}",
+            f"Score: {score}",
+            f"Channel: {channel_label(channel)} ({channel_code(channel)})",
+            f"Total winners: {len(rows)}",
+            f"Links sent: {sent}",
+            f"Failed telegram_ids: {', '.join(failed_ids) if failed_ids else '-'}",
+        ]
+    )
+    await message.bot.send_message(settings.admin_chat_id, summary)
+    if message.chat.id != settings.admin_chat_id:
+        await send_long_message(message, summary)
+
+
 @router.message(Command("remove_expired_preview"))
 async def remove_expired_preview(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -2969,6 +3269,30 @@ async def send_selected_channel_link(callback_query: CallbackQuery, settings: Se
     if callback_query.message:
         await callback_query.message.edit_text(f"Link enviado a {telegram_id} para {label} ({code}).")
     await callback_query.answer("Link enviado ✅")
+
+
+@router.callback_query(F.data.startswith("prediction:"))
+async def prediction_vote(callback_query: CallbackQuery, supabase: Client) -> None:
+    parts = (callback_query.data or "").split(":")
+    if len(parts) != 3:
+        await callback_query.answer("Pronóstico inválido.", show_alert=True)
+        return
+    game_code = parts[1]
+    scores = prediction_scores_for_game(game_code)
+    try:
+        score_index = int(parts[2])
+        selected_score = scores[score_index]
+    except (ValueError, IndexError):
+        await callback_query.answer("Pronóstico inválido.", show_alert=True)
+        return
+
+    try:
+        await asyncio.to_thread(upsert_prediction_vote, supabase, game_code, callback_query, selected_score)
+        await callback_query.answer("Tu pronóstico fue guardado ✅")
+    except Exception:
+        user_id = callback_query.from_user.id if callback_query.from_user else "unknown"
+        logger.exception("Could not save prediction vote game_code=%s user_id=%s", game_code, user_id)
+        await callback_query.answer("No pude guardar tu pronóstico.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("payment:"))
