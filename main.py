@@ -1081,6 +1081,15 @@ def pending_payment_keyboard(
                 InlineKeyboardButton(text="Ask another receipt 🔁", callback_data=f"payment:ask_receipt:{telegram_id}"),
             ],
             [
+                InlineKeyboardButton(text="🎯 Tirada x1", callback_data=f"payment:tirada:{telegram_id}:1"),
+                InlineKeyboardButton(text="🎯 Tirada x2", callback_data=f"payment:tirada:{telegram_id}:2"),
+                InlineKeyboardButton(text="🎯 Tirada x3", callback_data=f"payment:tirada:{telegram_id}:3"),
+            ],
+            [
+                InlineKeyboardButton(text="🎯 Tirada x4", callback_data=f"payment:tirada:{telegram_id}:4"),
+                InlineKeyboardButton(text="🎯 Tirada x5", callback_data=f"payment:tirada:{telegram_id}:5"),
+            ],
+            [
                 InlineKeyboardButton(
                     text="Confirm renewal ✅",
                     callback_data=f"payment:confirm_renewal:{telegram_id}",
@@ -1686,6 +1695,133 @@ def prediction_winner_rows(supabase: Client, game_code: str, score: str) -> list
         .execute()
     )
     return response.data or []
+
+
+def active_tirada_prizes(supabase: Client) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("tirada_prizes")
+        .select("*")
+        .eq("is_active", True)
+        .execute()
+    )
+    return [row for row in (response.data or []) if int(row.get("weight") or 0) > 0]
+
+
+def weighted_tirada_prize(prizes: list[dict[str, Any]]) -> dict[str, Any]:
+    total_weight = sum(int(prize.get("weight") or 0) for prize in prizes)
+    if total_weight <= 0:
+        raise ValueError("No active Tirada Mundial prizes configured.")
+    pick = secrets.randbelow(total_weight)
+    running = 0
+    for prize in prizes:
+        running += int(prize.get("weight") or 0)
+        if pick < running:
+            return prize
+    return prizes[-1]
+
+
+def current_tirada_order_for_receipt(
+    supabase: Client,
+    telegram_id: int,
+    pending_payment_file_id: str | None,
+) -> dict[str, Any] | None:
+    query = (
+        supabase.table("tirada_orders")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .order("created_at", desc=True)
+        .limit(1)
+    )
+    if pending_payment_file_id:
+        query = query.eq("pending_payment_file_id", pending_payment_file_id)
+    response = query.execute()
+    return response.data[0] if response.data else None
+
+
+def tirada_draws_for_order(supabase: Client, order_id: int) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("tirada_draws")
+        .select("*")
+        .eq("tirada_order_id", order_id)
+        .order("spin_number")
+        .execute()
+    )
+    return response.data or []
+
+
+def create_or_reuse_tirada_results(
+    supabase: Client,
+    telegram_id: int,
+    spin_count: int,
+    admin_id: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
+    if spin_count < 1 or spin_count > 5:
+        raise ValueError("spin_count inválido.")
+
+    user = get_registered_user(supabase, telegram_id) or {"telegram_id": telegram_id}
+    pending_payment_file_id = user.get("pending_payment_file_id")
+    order = current_tirada_order_for_receipt(supabase, telegram_id, pending_payment_file_id)
+    reused = bool(order)
+    now = now_utc_iso()
+    if not order:
+        payload = {
+            "telegram_id": telegram_id,
+            "username": user.get("username"),
+            "first_name": user.get("first_name"),
+            "last_name": user.get("last_name"),
+            "spin_count": spin_count,
+            "price_per_spin_mxn": 40,
+            "amount_paid_mxn": spin_count * 40,
+            "payment_status": "paid",
+            "pending_payment_file_id": pending_payment_file_id,
+            "pending_payment_file_type": user.get("pending_payment_file_type"),
+            "pending_payment_at": user.get("pending_payment_at"),
+            "approved_by_admin_id": admin_id,
+            "approved_at": now,
+            "updated_at": now,
+        }
+        response = supabase.table("tirada_orders").insert(payload).execute()
+        order = response.data[0]
+
+    draws = tirada_draws_for_order(supabase, int(order["id"]))
+    if draws:
+        return order, draws, reused
+
+    prizes = active_tirada_prizes(supabase)
+    draw_payloads: list[dict[str, Any]] = []
+    order_spin_count = int(order.get("spin_count") or spin_count)
+    for spin_number in range(1, order_spin_count + 1):
+        prize = weighted_tirada_prize(prizes)
+        draw_payloads.append(
+            {
+                "tirada_order_id": int(order["id"]),
+                "spin_number": spin_number,
+                "telegram_id": telegram_id,
+                "prize_id": int(prize["id"]),
+                "prize_code": prize["code"],
+                "prize_label": prize["label"],
+                "prize_payload": prize.get("metadata") or {},
+                "admin_id": admin_id,
+                "random_seed_hash": secrets.token_hex(16),
+            }
+        )
+    if draw_payloads:
+        supabase.table("tirada_draws").insert(draw_payloads).execute()
+    draws = tirada_draws_for_order(supabase, int(order["id"]))
+    return order, draws, reused
+
+
+def mark_tirada_results_sent(supabase: Client, order_id: int) -> None:
+    now = now_utc_iso()
+    supabase.table("tirada_orders").update({"result_sent_at": now, "updated_at": now}).eq("id", order_id).execute()
+    supabase.table("tirada_draws").update({"sent_to_user_at": now}).eq("tirada_order_id", order_id).execute()
+
+
+def tirada_results_text(draws: list[dict[str, Any]]) -> str:
+    lines = ["Resultados:"]
+    for index, draw in enumerate(draws, start=1):
+        lines.append(f"{index}. {draw.get('prize_label') or '-'}")
+    return "\n".join(lines)
 
 
 async def remove_user_from_channel(
@@ -3371,6 +3507,51 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
                 await callback_query.answer("Aprobado ✅")
             if selection_key:
                 PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
+        elif action == "tirada":
+            if len(parts) != 4:
+                await callback_query.answer("Acción inválida.", show_alert=True)
+                return
+            try:
+                spin_count = int(parts[3])
+            except ValueError:
+                await callback_query.answer("Cantidad inválida.", show_alert=True)
+                return
+            order, draws, reused = await asyncio.to_thread(
+                create_or_reuse_tirada_results,
+                supabase,
+                telegram_id,
+                spin_count,
+                callback_query.from_user.id,
+            )
+            results_text = tirada_results_text(draws)
+            dm_sent = True
+            try:
+                await callback_query.bot.send_message(
+                    telegram_id,
+                    "🎯 Tirada Mundial\n\n"
+                    f"{results_text}\n\n"
+                    "Para reclamar tu premio, contacta a @chivi01 💕",
+                )
+                await asyncio.to_thread(mark_tirada_results_sent, supabase, int(order["id"]))
+            except (TelegramBadRequest, TelegramForbiddenError):
+                dm_sent = False
+                logger.warning("Could not DM Tirada Mundial results telegram_id=%s", telegram_id, exc_info=True)
+
+            admin_text = (
+                "🎯 Tirada Mundial aprobada\n"
+                f"telegram_id: {telegram_id}\n"
+                f"spins: {order.get('spin_count') or spin_count}\n\n"
+                f"{results_text}"
+            )
+            if not dm_sent:
+                admin_text += "\n\nNo pude enviar el resultado por DM. El usuario debe abrir el bot o escribirle primero."
+            if reused:
+                admin_text += "\n\nResultados existentes reutilizados; no se volvió a sortear."
+            await callback_query.bot.send_message(settings.admin_chat_id, admin_text)
+            if dm_sent:
+                await callback_query.answer("Tirada Mundial enviada ✅")
+            else:
+                await callback_query.answer("Tirada guardada, pero no pude enviar DM.", show_alert=True)
         elif action == "reject":
             await reject_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
             selection_key = payment_selection_key(callback_query, telegram_id)
