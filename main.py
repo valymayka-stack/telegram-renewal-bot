@@ -262,7 +262,7 @@ create unique index if not exists prediction_votes_game_telegram_unique_idx
 logger = logging.getLogger(__name__)
 router = Router()
 PAYMENT_CHANNEL_SELECTIONS: dict[tuple[int, int, int], set[str]] = {}
-PENDING_PAYMENT_ADMIN_MESSAGES: dict[tuple[int, int, int], int] = {}
+PENDING_PAYMENT_ADMIN_MESSAGES: dict[tuple[int, int], int] = {}
 
 
 @dataclass(frozen=True)
@@ -834,7 +834,13 @@ async def delete_pending_payment_admin_messages(bot: Bot, selection_key: tuple[i
     if not selection_key:
         return
     chat_id, admin_message_id, telegram_id = selection_key
-    receipt_message_id = PENDING_PAYMENT_ADMIN_MESSAGES.pop(selection_key, None)
+    receipt_message_id = PENDING_PAYMENT_ADMIN_MESSAGES.pop((chat_id, admin_message_id), None)
+    if not receipt_message_id:
+        logger.warning(
+            "Missing copied receipt message id for pending payment cleanup telegram_id=%s admin_message_id=%s",
+            telegram_id,
+            admin_message_id,
+        )
     for message_id in (receipt_message_id, admin_message_id):
         if not message_id:
             continue
@@ -2079,7 +2085,7 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
                 None,
             ),
         )
-        PENDING_PAYMENT_ADMIN_MESSAGES[(settings.admin_chat_id, admin_message.message_id, user.id)] = copied_receipt.message_id
+        PENDING_PAYMENT_ADMIN_MESSAGES[(admin_message.chat.id, admin_message.message_id)] = copied_receipt.message_id
         logger.info("Payment receipt submitted telegram_id=%s", user.id)
     except Exception:
         logger.exception("Could not notify admin about payment receipt telegram_id=%s", user.id)
