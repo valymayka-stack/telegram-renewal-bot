@@ -262,6 +262,7 @@ create unique index if not exists prediction_votes_game_telegram_unique_idx
 logger = logging.getLogger(__name__)
 router = Router()
 PAYMENT_CHANNEL_SELECTIONS: dict[tuple[int, int, int], set[str]] = {}
+PENDING_PAYMENT_ADMIN_MESSAGES: dict[tuple[int, int, int], int] = {}
 
 
 @dataclass(frozen=True)
@@ -827,6 +828,25 @@ def payment_selection_key(callback_query: CallbackQuery, telegram_id: int) -> tu
     if not callback_query.message:
         return None
     return (callback_query.message.chat.id, callback_query.message.message_id, telegram_id)
+
+
+async def delete_pending_payment_admin_messages(bot: Bot, selection_key: tuple[int, int, int] | None) -> None:
+    if not selection_key:
+        return
+    chat_id, admin_message_id, telegram_id = selection_key
+    receipt_message_id = PENDING_PAYMENT_ADMIN_MESSAGES.pop(selection_key, None)
+    for message_id in (receipt_message_id, admin_message_id):
+        if not message_id:
+            continue
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            logger.warning(
+                "Could not delete pending payment admin message telegram_id=%s message_id=%s",
+                telegram_id,
+                message_id,
+                exc_info=True,
+            )
 
 
 def payment_receipt_file_url(file_id: Any) -> str | None:
@@ -2043,12 +2063,12 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         f"pending_payment_at: {now}"
     )
     try:
-        await message.bot.copy_message(
+        copied_receipt = await message.bot.copy_message(
             chat_id=settings.admin_chat_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id,
         )
-        await message.bot.send_message(
+        admin_message = await message.bot.send_message(
             settings.admin_chat_id,
             admin_text,
             reply_markup=await asyncio.to_thread(
@@ -2059,6 +2079,7 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
                 None,
             ),
         )
+        PENDING_PAYMENT_ADMIN_MESSAGES[(settings.admin_chat_id, admin_message.message_id, user.id)] = copied_receipt.message_id
         logger.info("Payment receipt submitted telegram_id=%s", user.id)
     except Exception:
         logger.exception("Could not notify admin about payment receipt telegram_id=%s", user.id)
@@ -3340,6 +3361,7 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             selection_key = payment_selection_key(callback_query, telegram_id)
             if selection_key:
                 PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
+            await delete_pending_payment_admin_messages(callback_query.bot, selection_key)
             await callback_query.answer("Rechazado ❌")
         elif action == "ask_receipt":
             await ask_new_receipt(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
