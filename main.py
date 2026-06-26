@@ -924,9 +924,14 @@ def format_raffle_numbers(rows: list[dict[str, Any]]) -> str:
 
 
 def get_reserved_raffle_order(supabase: Client, telegram_id: int) -> list[dict[str, Any]]:
+    active_raffle = get_active_raffle(supabase)
+    if not active_raffle:
+        logger.info("No active raffle found while checking receipt telegram_id=%s", telegram_id)
+        return []
     latest = (
         supabase.table("raffle_tickets")
         .select("*")
+        .eq("raffle_id", active_raffle["id"])
         .eq("telegram_id", telegram_id)
         .eq("payment_status", "reserved")
         .order("reserved_at", desc=True)
@@ -934,16 +939,25 @@ def get_reserved_raffle_order(supabase: Client, telegram_id: int) -> list[dict[s
         .execute()
     )
     if not latest.data:
+        logger.info("No reserved raffle tickets found for active raffle telegram_id=%s raffle_id=%s", telegram_id, active_raffle["id"])
         return []
     order_id = latest.data[0]["order_id"]
     response = (
         supabase.table("raffle_tickets")
         .select("*")
+        .eq("raffle_id", active_raffle["id"])
         .eq("order_id", order_id)
         .eq("telegram_id", telegram_id)
         .eq("payment_status", "reserved")
         .order("ticket_number")
         .execute()
+    )
+    logger.info(
+        "Reserved raffle order detected telegram_id=%s raffle_id=%s order_id=%s ticket_count=%s",
+        telegram_id,
+        active_raffle["id"],
+        order_id,
+        len(response.data or []),
     )
     return response.data or []
 
@@ -2312,6 +2326,13 @@ async def handle_raffle_receipt(message: Message, settings: Settings, supabase: 
     file_type = "photo" if message.photo else "document"
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     order_id = str(order_rows[0]["order_id"])
+    logger.info(
+        "Raffle receipt detected telegram_id=%s order_id=%s ticket_count=%s file_type=%s",
+        message.from_user.id,
+        order_id,
+        len(order_rows),
+        file_type,
+    )
     await asyncio.to_thread(update_raffle_order_receipt, supabase, order_id, file_id, file_type)
     ticket_numbers = format_raffle_numbers(order_rows)
     amount_expected = sum(int(row.get("amount_expected_mxn") or 0) for row in order_rows)
@@ -2320,6 +2341,7 @@ async def handle_raffle_receipt(message: Message, settings: Settings, supabase: 
         "Comprobante de sorteo pendiente\n"
         f"Telegram ID: {message.from_user.id}\n"
         f"Username: {username}\n"
+        f"First name: {message.from_user.first_name or '-'}\n"
         f"Boletos reservados:\n{ticket_numbers}\n"
         f"Pago esperado: ${amount_expected} MXN"
     )
@@ -2340,7 +2362,13 @@ async def handle_raffle_receipt(message: Message, settings: Settings, supabase: 
         admin_message = await message.bot.send_message(settings.admin_chat_id, admin_text, reply_markup=keyboard)
         RAFFLE_ADMIN_MESSAGES[(admin_message.chat.id, admin_message.message_id)] = copied_receipt.message_id
         await message.answer("Comprobante recibido ✅ Lo revisaremos para confirmar tus boletos.")
-        logger.info("Raffle receipt submitted telegram_id=%s order_id=%s", message.from_user.id, order_id)
+        logger.info(
+            "Raffle receipt admin notification sent telegram_id=%s order_id=%s admin_message_id=%s copied_receipt_id=%s",
+            message.from_user.id,
+            order_id,
+            admin_message.message_id,
+            copied_receipt.message_id,
+        )
     except Exception:
         logger.exception("Could not notify admin about raffle receipt telegram_id=%s", message.from_user.id)
         await message.answer("Recibimos tu comprobante, pero no pude avisar al admin. Intenta de nuevo en un momento.")
