@@ -1169,12 +1169,75 @@ def cancel_reserved_raffle_tickets_for_user(supabase: Client, raffle_id: int, te
 
 def raffle_stats(supabase: Client, raffle_id: int) -> dict[str, int]:
     rows = supabase.table("raffle_tickets").select("*").eq("raffle_id", raffle_id).execute().data or []
+    active_rows = [row for row in rows if row.get("payment_status") in {"reserved", "confirmed"}]
     return {
+        "users": len({row.get("telegram_id") for row in rows if row.get("telegram_id")}),
         "reserved": sum(1 for row in rows if row.get("payment_status") == "reserved"),
         "confirmed": sum(1 for row in rows if row.get("payment_status") == "confirmed"),
         "cancelled": sum(1 for row in rows if row.get("payment_status") == "cancelled"),
-        "revenue": sum(int(row.get("amount_paid_mxn") or 0) for row in rows if row.get("payment_status") == "confirmed"),
+        "expected_revenue": sum(int(row.get("amount_expected_mxn") or 0) for row in active_rows),
+        "confirmed_revenue": sum(int(row.get("amount_paid_mxn") or 0) for row in rows if row.get("payment_status") == "confirmed"),
     }
+
+
+def raffle_ticket_rows(supabase: Client, raffle_id: int, payment_status: str | None = None) -> list[dict[str, Any]]:
+    query = supabase.table("raffle_tickets").select("*").eq("raffle_id", raffle_id)
+    if payment_status:
+        query = query.eq("payment_status", payment_status)
+    rows = query.execute().data or []
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("telegram_id") or ""),
+            str(row.get("order_id") or ""),
+            str(row.get("payment_status") or ""),
+            str(row.get("ticket_number") or ""),
+        ),
+    )
+
+
+def raffle_ticket_rows_for_user(supabase: Client, raffle_id: int, lookup: str) -> list[dict[str, Any]]:
+    rows = raffle_ticket_rows(supabase, raffle_id)
+    normalized = lookup.strip().lstrip("@").lower()
+    return [
+        row
+        for row in rows
+        if str(row.get("telegram_id") or "") == normalized
+        or str(row.get("username") or "").lower().lstrip("@") == normalized
+    ]
+
+
+def format_raffle_ticket_report(rows: list[dict[str, Any]], title: str) -> str:
+    if not rows:
+        return f"{title}\n\nNo raffle tickets found."
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (
+            str(row.get("telegram_id") or ""),
+            str(row.get("order_id") or "no-order"),
+            str(row.get("payment_status") or "-"),
+        )
+        groups.setdefault(key, []).append(row)
+    lines = [title]
+    for (telegram_id, order_id, payment_status), group_rows in groups.items():
+        first = group_rows[0]
+        tickets = ", ".join(str(row.get("ticket_number") or "-") for row in group_rows)
+        expected = sum(int(row.get("amount_expected_mxn") or 0) for row in group_rows)
+        paid = sum(int(row.get("amount_paid_mxn") or 0) for row in group_rows)
+        lines.extend(
+            [
+                "",
+                f"Telegram ID: {telegram_id}",
+                f"Username: @{first.get('username') or '-'}",
+                f"First name: {first.get('first_name') or '-'}",
+                f"Order: {order_id}",
+                f"Tickets: {tickets}",
+                f"Payment status: {payment_status}",
+                f"Expected amount: ${expected} MXN",
+                f"Paid amount: ${paid} MXN",
+            ]
+        )
+    return "\n".join(lines)[:3900]
 
 
 def confirmed_raffle_tickets(supabase: Client, raffle_id: int) -> list[dict[str, Any]]:
@@ -2519,11 +2582,64 @@ async def raffle_stats_command(message: Message, settings: Settings, supabase: C
     stats = await asyncio.to_thread(raffle_stats, supabase, int(raffle["id"]))
     await message.answer(
         f"{raffle.get('title')}\n\n"
+        f"Users: {stats['users']}\n"
         f"Reserved tickets: {stats['reserved']}\n"
         f"Confirmed tickets: {stats['confirmed']}\n"
         f"Cancelled tickets: {stats['cancelled']}\n"
-        f"Total revenue: ${stats['revenue']} MXN"
+        f"Expected revenue: ${stats['expected_revenue']} MXN\n"
+        f"Confirmed revenue: ${stats['confirmed_revenue']} MXN"
     )
+
+
+async def send_raffle_ticket_report(
+    message: Message,
+    settings: Settings,
+    supabase: Client,
+    title: str,
+    payment_status: str | None = None,
+    user_lookup: str | None = None,
+) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    raffle = await asyncio.to_thread(get_active_raffle, supabase)
+    if not raffle:
+        await message.answer("No active raffle found.")
+        return
+    if user_lookup:
+        rows = await asyncio.to_thread(raffle_ticket_rows_for_user, supabase, int(raffle["id"]), user_lookup)
+    else:
+        rows = await asyncio.to_thread(raffle_ticket_rows, supabase, int(raffle["id"]), payment_status)
+    await message.answer(format_raffle_ticket_report(rows, title))
+
+
+@router.message(Command("raffle_users"))
+async def raffle_users_command(message: Message, settings: Settings, supabase: Client) -> None:
+    await send_raffle_ticket_report(message, settings, supabase, "Raffle participants")
+
+
+@router.message(Command("raffle_user"))
+async def raffle_user_command(message: Message, settings: Settings, supabase: Client) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Uso: /raffle_user <telegram_id_or_username>")
+        return
+    await send_raffle_ticket_report(message, settings, supabase, f"Raffle user: {parts[1]}", user_lookup=parts[1])
+
+
+@router.message(Command("raffle_pending"))
+async def raffle_pending_command(message: Message, settings: Settings, supabase: Client) -> None:
+    await send_raffle_ticket_report(message, settings, supabase, "Reserved raffle tickets", payment_status="reserved")
+
+
+@router.message(Command("raffle_confirmed"))
+async def raffle_confirmed_command(message: Message, settings: Settings, supabase: Client) -> None:
+    await send_raffle_ticket_report(message, settings, supabase, "Confirmed raffle tickets", payment_status="confirmed")
+
+
+@router.message(Command("raffle_cancelled"))
+async def raffle_cancelled_command(message: Message, settings: Settings, supabase: Client) -> None:
+    await send_raffle_ticket_report(message, settings, supabase, "Cancelled raffle tickets", payment_status="cancelled")
 
 
 @router.message(Command("raffle_tickets"))
