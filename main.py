@@ -2457,13 +2457,6 @@ async def send_raffle_quantity_prompt(bot: Bot, user_id: int, raffle: dict[str, 
         return False
 
 
-async def send_admin_debug(bot: Bot, settings: Settings, text: str) -> None:
-    try:
-        await bot.send_message(settings.admin_chat_id, text)
-    except Exception:
-        logger.warning("Could not send admin debug message: %s", text, exc_info=True)
-
-
 async def handle_raffle_receipt(
     message: Message,
     settings: Settings,
@@ -2490,16 +2483,24 @@ async def handle_raffle_receipt(
         file_type,
     )
     await asyncio.to_thread(update_raffle_tickets_receipt_by_ids, supabase, ticket_ids, file_id, file_type)
-    ticket_numbers = format_raffle_numbers(order_rows)
+    raffle = await asyncio.to_thread(get_raffle_by_id, supabase, raffle_id)
+    ticket_numbers = "\n".join(str(row.get("ticket_number") or "-") for row in order_rows)
     amount_expected = sum(int(row.get("amount_expected_mxn") or 0) for row in order_rows)
     username = f"@{message.from_user.username}" if message.from_user.username else "-"
     admin_text = (
-        "Comprobante de sorteo pendiente\n"
-        f"Telegram ID: {message.from_user.id}\n"
-        f"Username: {username}\n"
-        f"First name: {message.from_user.first_name or '-'}\n"
-        f"Boletos reservados:\n{ticket_numbers}\n"
-        f"Pago esperado: ${amount_expected} MXN"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🎟️ NEW RAFFLE PAYMENT\n\n"
+        "👤 User:\n"
+        f"{username}\n\n"
+        "🆔 Telegram ID:\n"
+        f"{message.from_user.id}\n\n"
+        "🎟️ Reserved Tickets:\n"
+        f"{ticket_numbers}\n\n"
+        "💰 Expected Payment:\n"
+        f"${amount_expected} MXN\n\n"
+        "📅 Raffle:\n"
+        f"{(raffle or {}).get('title') or '-'}\n\n"
+        "━━━━━━━━━━━━━━━━━━"
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2518,11 +2519,6 @@ async def handle_raffle_receipt(
         )
     except Exception as exc:
         logger.exception("Could not copy raffle receipt telegram_id=%s", message.from_user.id)
-        await send_admin_debug(
-            message.bot,
-            settings,
-            f"DEBUG raffle receipt copy error for {message.from_user.id}: {exc}",
-        )
         await message.answer("Recibimos tu comprobante, pero no pude copiarlo al admin. Intenta de nuevo en un momento.")
         return True
     try:
@@ -2538,11 +2534,6 @@ async def handle_raffle_receipt(
         )
     except Exception as exc:
         logger.exception("Could not notify admin about raffle receipt telegram_id=%s", message.from_user.id)
-        await send_admin_debug(
-            message.bot,
-            settings,
-            f"DEBUG raffle review message error for {message.from_user.id}: {exc}",
-        )
         await message.answer("Recibimos tu comprobante, pero no pude avisar al admin. Intenta de nuevo en un momento.")
     return True
 
@@ -2742,10 +2733,10 @@ async def raffle_trigger_text(message: Message, settings: Settings, supabase: Cl
 async def receive_payment_receipt(message: Message, settings: Settings, supabase: Client) -> None:
     if not message.from_user:
         return
-    await send_admin_debug(message.bot, settings, f"DEBUG receipt received from {message.from_user.id}")
+    logger.info("Receipt received from telegram_id=%s", message.from_user.id)
     raffle_order_rows: list[dict[str, Any]] = []
     try:
-        await send_admin_debug(message.bot, settings, "DEBUG active raffle lookup started")
+        logger.info("Active raffle lookup started for telegram_id=%s", message.from_user.id)
         active_response = await asyncio.wait_for(
             asyncio.to_thread(
                 lambda: supabase.table("raffle_events")
@@ -2758,23 +2749,16 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         )
         active_raffle = active_response.data[0] if active_response.data else None
         if not active_raffle:
-            await send_admin_debug(
-                message.bot,
-                settings,
-                f"DEBUG no raffle reserved tickets found for {message.from_user.id}; continuing normal payment flow",
-            )
+            logger.info("No active raffle found for receipt telegram_id=%s; continuing normal payment flow", message.from_user.id)
         else:
             active_raffle_id = active_raffle["id"]
-            await send_admin_debug(
-                message.bot,
-                settings,
-                f"DEBUG active raffle found: {active_raffle_id}, {active_raffle.get('code')}",
+            logger.info(
+                "Active raffle found for receipt telegram_id=%s raffle_id=%s code=%s",
+                message.from_user.id,
+                active_raffle_id,
+                active_raffle.get("code"),
             )
-            await send_admin_debug(
-                message.bot,
-                settings,
-                f"DEBUG reserved ticket lookup started for telegram_id={message.from_user.id}, raffle_id={active_raffle_id}",
-            )
+            logger.info("Reserved raffle ticket lookup started telegram_id=%s raffle_id=%s", message.from_user.id, active_raffle_id)
             reserved_response = await asyncio.wait_for(
                 asyncio.to_thread(
                     lambda: supabase.table("raffle_tickets")
@@ -2787,36 +2771,20 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
                 timeout=20,
             )
             raffle_order_rows = sorted(reserved_response.data or [], key=lambda row: str(row.get("ticket_number") or ""))
-            await send_admin_debug(
-                message.bot,
-                settings,
-                f"DEBUG reserved ticket rows found: {len(raffle_order_rows)}",
-            )
             tickets = ", ".join(str(row.get("ticket_number")) for row in raffle_order_rows)
-            await send_admin_debug(
-                message.bot,
-                settings,
-                f"DEBUG ticket numbers: {tickets or '-'}",
+            logger.info(
+                "Reserved raffle ticket rows found telegram_id=%s raffle_id=%s count=%s tickets=%s",
+                message.from_user.id,
+                active_raffle_id,
+                len(raffle_order_rows),
+                tickets or "-",
             )
             if raffle_order_rows:
-                await send_admin_debug(
-                    message.bot,
-                    settings,
-                    f"DEBUG raffle reserved tickets found for {message.from_user.id}: {tickets}",
-                )
+                logger.info("Routing receipt to raffle flow telegram_id=%s tickets=%s", message.from_user.id, tickets)
             else:
-                await send_admin_debug(
-                    message.bot,
-                    settings,
-                    f"DEBUG no raffle reserved tickets found for {message.from_user.id}; continuing normal payment flow",
-                )
+                logger.info("No raffle reserved tickets found for telegram_id=%s; continuing normal payment flow", message.from_user.id)
     except Exception as exc:
         logger.exception("Raffle lookup error telegram_id=%s", message.from_user.id)
-        await send_admin_debug(
-            message.bot,
-            settings,
-            f"DEBUG raffle lookup error: {repr(exc)}",
-        )
     if raffle_order_rows and await handle_raffle_receipt(message, settings, supabase, raffle_order_rows):
         return
     if message.from_user.id in settings.admin_user_ids:
