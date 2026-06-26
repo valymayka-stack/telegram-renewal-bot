@@ -2317,10 +2317,23 @@ async def send_raffle_quantity_prompt(bot: Bot, user_id: int, raffle: dict[str, 
         return False
 
 
-async def handle_raffle_receipt(message: Message, settings: Settings, supabase: Client) -> bool:
+async def send_admin_debug(bot: Bot, settings: Settings, text: str) -> None:
+    try:
+        await bot.send_message(settings.admin_chat_id, text)
+    except Exception:
+        logger.warning("Could not send admin debug message: %s", text, exc_info=True)
+
+
+async def handle_raffle_receipt(
+    message: Message,
+    settings: Settings,
+    supabase: Client,
+    order_rows: list[dict[str, Any]] | None = None,
+) -> bool:
     if not message.from_user:
         return False
-    order_rows = await asyncio.to_thread(get_reserved_raffle_order, supabase, message.from_user.id)
+    if order_rows is None:
+        order_rows = await asyncio.to_thread(get_reserved_raffle_order, supabase, message.from_user.id)
     if not order_rows:
         return False
     file_type = "photo" if message.photo else "document"
@@ -2515,13 +2528,28 @@ async def raffle_trigger_text(message: Message, settings: Settings, supabase: Cl
 
 @router.message(F.chat.type == "private", (F.photo | F.document))
 async def receive_payment_receipt(message: Message, settings: Settings, supabase: Client) -> None:
-    if message.from_user and message.from_user.id in settings.admin_user_ids:
-        return
     if not message.from_user:
+        return
+    await send_admin_debug(message.bot, settings, f"DEBUG receipt received from {message.from_user.id}")
+    if message.from_user.id in settings.admin_user_ids:
         return
     if await asyncio.to_thread(should_ignore_blacklisted, supabase, settings, message.from_user.id):
         return
-    if await handle_raffle_receipt(message, settings, supabase):
+    raffle_order_rows = await asyncio.to_thread(get_reserved_raffle_order, supabase, message.from_user.id)
+    if raffle_order_rows:
+        tickets = ", ".join(str(row.get("ticket_number")) for row in raffle_order_rows)
+        await send_admin_debug(
+            message.bot,
+            settings,
+            f"DEBUG raffle reserved tickets found for {message.from_user.id}: {tickets}",
+        )
+    else:
+        await send_admin_debug(
+            message.bot,
+            settings,
+            f"DEBUG no raffle reserved tickets found for {message.from_user.id}; continuing normal payment flow",
+        )
+    if await handle_raffle_receipt(message, settings, supabase, raffle_order_rows):
         return
 
     now = now_utc_iso()
