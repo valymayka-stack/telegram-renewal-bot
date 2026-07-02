@@ -40,6 +40,13 @@ CONFIRM_SUBSCRIPTION_BUTTON_TEXT = "CONFIRMAR SUSCRIPCIÓN ✅"
 CONFIRM_SUBSCRIPTION_CALLBACK_DATA = "confirm_subscription_v1"
 CONFIRMATION_CAMPAIGN = "subscription_confirmation_v1"
 CONFIRMATION_SOURCE = "confirm_subscription_button"
+INVITE_LINK_LIFETIME = timedelta(hours=24)
+HIDDEN_APPROVAL_CHANNEL_CODES = {
+    "regalo_renovacion",
+    "regalo_marcador_exacto",
+    "mexico_ecuador",
+    "regalo_partido",
+}
 PREDICTION_MEX_ECUADOR_GAME_CODE = "mex_ecuador"
 PREDICTION_MEX_ECUADOR_SCORES = [
     "México 1-0 Ecuador",
@@ -1504,6 +1511,8 @@ def pending_payment_keyboard(
     current_row: list[InlineKeyboardButton] = []
     for channel in channels:
         key = channel_code(channel)
+        if key in HIDDEN_APPROVAL_CHANNEL_CODES:
+            continue
         label = channel_label(channel)
         marker = "✅ " if key in selected else "⬜ "
         current_row.append(
@@ -1545,7 +1554,7 @@ async def create_one_use_invite_link(bot: Bot, settings: Settings, telegram_id: 
         chat_id=settings.content_channel_id,
         name=name,
         member_limit=1,
-        expire_date=datetime.now(timezone.utc) + timedelta(hours=1),
+        expire_date=datetime.now(timezone.utc) + INVITE_LINK_LIFETIME,
     )
     return invite.invite_link, name
 
@@ -1557,7 +1566,7 @@ async def create_one_use_invite_link_for_chat(bot: Bot, chat_id: int | str, tele
         chat_id=chat_id,
         name=name,
         member_limit=1,
-        expire_date=datetime.now(timezone.utc) + timedelta(hours=1),
+        expire_date=datetime.now(timezone.utc) + INVITE_LINK_LIFETIME,
     )
     return invite.invite_link, name
 
@@ -1565,7 +1574,7 @@ async def create_one_use_invite_link_for_chat(bot: Bot, chat_id: int | str, tele
 async def create_manual_open_invite_link(bot: Bot, chat_id: int | str, channel_code_value: str) -> tuple[str, str, datetime]:
     timestamp = int(datetime.now(timezone.utc).timestamp())
     name = f"manual-open-{channel_code_value}-{timestamp}"[:32]
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    expires_at = datetime.now(timezone.utc) + INVITE_LINK_LIFETIME
     invite = await bot.create_chat_invite_link(
         chat_id=chat_id,
         name=name,
@@ -1583,7 +1592,7 @@ def has_active_unused_invite(row: dict[str, Any] | None) -> bool:
     created_at = parse_iso_datetime(row.get("invite_link_created_at"))
     if not created_at:
         return False
-    return datetime.now(timezone.utc) - created_at < timedelta(hours=1)
+    return datetime.now(timezone.utc) - created_at < INVITE_LINK_LIFETIME
 
 
 def payment_recently_approved(row: dict[str, Any] | None) -> bool:
