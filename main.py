@@ -47,40 +47,40 @@ HIDDEN_APPROVAL_CHANNEL_CODES = {
     "mexico_ecuador",
     "regalo_partido",
 }
-PREDICTION_MEX_ECUADOR_GAME_CODE = "mex_ecuador"
-PREDICTION_MEX_ECUADOR_SCORES = [
-    "México 1-0 Ecuador",
-    "México 2-0 Ecuador",
-    "México 2-1 Ecuador",
-    "México 3-0 Ecuador",
-    "México 3-1 Ecuador",
-    "México 0-0 Ecuador",
-    "México 1-1 Ecuador",
-    "México 2-2 Ecuador",
-    "México 0-1 Ecuador",
-    "México 1-2 Ecuador",
+PREDICTION_MEX_INGLATERRA_GAME_CODE = "mex_inglaterra"
+PREDICTION_MEX_INGLATERRA_SCORES = [
+    "México 1-0 Inglaterra",
+    "México 2-0 Inglaterra",
+    "México 2-1 Inglaterra",
+    "México 3-0 Inglaterra",
+    "México 3-1 Inglaterra",
+    "México 0-0 Inglaterra",
+    "México 1-1 Inglaterra",
+    "México 2-2 Inglaterra",
+    "México 0-1 Inglaterra",
+    "México 1-2 Inglaterra",
     "Se define en penales",
 ]
 PREDICTION_GAMES = {
-    PREDICTION_MEX_ECUADOR_GAME_CODE: PREDICTION_MEX_ECUADOR_SCORES,
+    PREDICTION_MEX_INGLATERRA_GAME_CODE: PREDICTION_MEX_INGLATERRA_SCORES,
 }
 PREDICTION_BUTTON_LABELS = {
-    PREDICTION_MEX_ECUADOR_GAME_CODE: [
-        "🇲🇽 1-0 🇪🇨",
-        "🇲🇽 2-0 🇪🇨",
-        "🇲🇽 2-1 🇪🇨",
-        "🇲🇽 3-0 🇪🇨",
-        "🇲🇽 3-1 🇪🇨",
-        "🇲🇽 0-0 🇪🇨",
-        "🇲🇽 1-1 🇪🇨",
-        "🇲🇽 2-2 🇪🇨",
-        "🇲🇽 0-1 🇪🇨",
-        "🇲🇽 1-2 🇪🇨",
+    PREDICTION_MEX_INGLATERRA_GAME_CODE: [
+        "🇲🇽 1-0 🏴",
+        "🇲🇽 2-0 🏴",
+        "🇲🇽 2-1 🏴",
+        "🇲🇽 3-0 🏴",
+        "🇲🇽 3-1 🏴",
+        "🇲🇽 0-0 🏴",
+        "🇲🇽 1-1 🏴",
+        "🇲🇽 2-2 🏴",
+        "🇲🇽 0-1 🏴",
+        "🇲🇽 1-2 🏴",
         "🥅 Se define en penales",
     ],
 }
-PREDICTION_MEX_ECUADOR_TEXT = (
-    "⚽ Pronóstico México vs Ecuador\n\n"
+PREDICTION_MEX_INGLATERRA_TEXT = (
+    "⚽ Pronóstico México vs Inglaterra\n\n"
     "Elige tu marcador. Solo cuenta un pronóstico por usuario; si cambias de opción, se actualiza tu elección."
 )
 RAFFLE_BUTTON_TEXT = "🎟️ QUIERO MIS BOLETOS"
@@ -2449,9 +2449,9 @@ async def send_confirm_subscription(message: Message, settings: Settings) -> Non
     await message.answer("Mensaje de confirmación enviado al canal.")
 
 
-@router.message(F.text.startswith("/send_mex_ecuador_prediction"))
-@router.message(Command("send_mex_ecuador_prediction"))
-async def send_mex_ecuador_prediction(message: Message, settings: Settings) -> None:
+@router.message(F.text.startswith("/send_mex_inglaterra_prediction"))
+@router.message(Command("send_mex_inglaterra_prediction"))
+async def send_mex_inglaterra_prediction(message: Message, settings: Settings) -> None:
     if not is_admin(message, settings):
         await reject_non_admin(message)
         return
@@ -2459,15 +2459,15 @@ async def send_mex_ecuador_prediction(message: Message, settings: Settings) -> N
     try:
         await message.bot.send_message(
             chat_id=settings.content_channel_id,
-            text=PREDICTION_MEX_ECUADOR_TEXT,
-            reply_markup=build_prediction_keyboard(PREDICTION_MEX_ECUADOR_GAME_CODE),
+            text=PREDICTION_MEX_INGLATERRA_TEXT,
+            reply_markup=build_prediction_keyboard(PREDICTION_MEX_INGLATERRA_GAME_CODE),
         )
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
-        logger.exception("Could not send Mexico Ecuador prediction")
+        logger.exception("Could not send Mexico England prediction")
         await message.answer(f"No pude enviar el pronóstico: {exc}")
         return
 
-    await message.answer("Pronóstico México vs Ecuador enviado al canal.")
+    await message.answer("Pronóstico México vs Inglaterra enviado al canal.")
 
 
 async def send_raffle_quantity_prompt(bot: Bot, user_id: int, raffle: dict[str, Any]) -> bool:
@@ -3764,10 +3764,10 @@ async def prediction_winners(message: Message, settings: Settings, supabase: Cli
     try:
         parts = shlex.split(message.text or "")
     except ValueError:
-        await message.answer('Uso: /prediction_winners mex_ecuador "México 2-1 Ecuador"')
+        await message.answer('Uso: /prediction_winners mex_inglaterra "México 2-1 Inglaterra"')
         return
     if len(parts) < 3:
-        await message.answer('Uso: /prediction_winners mex_ecuador "México 2-1 Ecuador"')
+        await message.answer('Uso: /prediction_winners mex_inglaterra "México 2-1 Inglaterra"')
         return
     game_code = parts[1]
     score = " ".join(parts[2:])
@@ -3792,10 +3792,10 @@ async def send_prediction_winners_link(message: Message, settings: Settings, sup
     try:
         parts = shlex.split(message.text or "")
     except ValueError:
-        await message.answer('Uso: /send_prediction_winners_link mex_ecuador "México 2-1 Ecuador" mexico_ecuador')
+        await message.answer('Uso: /send_prediction_winners_link mex_inglaterra "México 2-1 Inglaterra" mex_vs_inglaterra')
         return
     if len(parts) < 4:
-        await message.answer('Uso: /send_prediction_winners_link mex_ecuador "México 2-1 Ecuador" mexico_ecuador')
+        await message.answer('Uso: /send_prediction_winners_link mex_inglaterra "México 2-1 Inglaterra" mex_vs_inglaterra')
         return
 
     game_code = parts[1]
