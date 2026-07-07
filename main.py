@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -3033,6 +3034,40 @@ async def user_record(message: Message, settings: Settings, supabase: Client) ->
     await send_long_message(message, format_user_record(row or {}))
 
 
+@router.message(Command("reset_user"))
+async def reset_user_session(message: Message, settings: Settings, fsm_manager: Any) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /reset_user <telegram_id>")
+        return
+
+    context: FSMContext = fsm_manager.get_context(
+        bot=message.bot,
+        chat_id=telegram_id,
+        user_id=telegram_id,
+    )
+    state = await context.get_state()
+    data = await context.get_data()
+    if state is None and not data:
+        await message.answer("User has no active session.\nNothing to reset.")
+        return
+
+    await context.clear()
+    logger.info(
+        "Admin reset user FSM session admin_id=%s telegram_id=%s previous_state=%s",
+        message.from_user.id if message.from_user else None,
+        telegram_id,
+        state,
+    )
+    await message.answer(
+        "✅ User session reset successfully.\n\n"
+        f"Telegram ID:\n{telegram_id}"
+    )
+
+
 @router.message(Command("payment_history"))
 async def payment_history_command(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -4546,6 +4581,7 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
             allowed_updates=dp.resolve_used_update_types(),
             settings=settings,
             supabase=supabase,
+            fsm_manager=dp.fsm,
         )
     finally:
         scheduler.shutdown(wait=False)
