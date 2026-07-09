@@ -284,6 +284,11 @@ create index if not exists prediction_votes_updated_at_idx
   on public.prediction_votes (updated_at desc);
 create unique index if not exists prediction_votes_game_telegram_unique_idx
   on public.prediction_votes (game_code, telegram_id);
+create table if not exists public.bot_state (
+  key text primary key,
+  value text,
+  updated_at timestamptz default now()
+);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -507,6 +512,74 @@ def get_registered_user(supabase: Client, telegram_id: int) -> dict[str, Any] | 
         .execute()
     )
     return response.data[0] if response.data else None
+
+
+def fetch_users_summary(supabase: Client) -> tuple[int, list[dict[str, Any]]]:
+    count_response = supabase.table("telegram_users").select("*", count="exact").execute()
+    latest_response = (
+        supabase.table("telegram_users")
+        .select("*")
+        .order("registered_at", desc=True)
+        .limit(10)
+        .execute()
+    )
+    return count_response.count or 0, latest_response.data or []
+
+
+def fetch_unconfirmed_users(supabase: Client, limit: int = 500) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("telegram_users")
+        .select("*")
+        .order("registered_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return [row for row in (response.data or []) if row.get("confirmed_subscription") is not True]
+
+
+def fetch_pending_payment_users(supabase: Client, limit: int = 100) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("telegram_users")
+        .select("*")
+        .eq("payment_status", "pending_review")
+        .order("pending_payment_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return response.data or []
+
+
+def set_user_expiry_date(supabase: Client, telegram_id: int, expiry: str) -> bool:
+    if not get_registered_user(supabase, telegram_id):
+        return False
+    (
+        supabase.table("telegram_users")
+        .update({"expiry_date": expiry})
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+    return True
+
+
+def fetch_users_for_notice_day(supabase: Client, target: str, column: str) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("telegram_users")
+        .select("*")
+        .eq("status", "active")
+        .eq("expiry_date", target)
+        .is_(column, "null")
+        .execute()
+    )
+    return response.data or []
+
+
+def mark_notice_sent(supabase: Client, column: str, sent_ids: list[int]) -> None:
+    (
+        supabase.table("telegram_users")
+        .update({column: now_utc_iso()})
+        .in_("telegram_id", sent_ids)
+        .execute()
+    )
 
 
 def get_user_by_invite_link_name(supabase: Client, invite_link_name: str) -> dict[str, Any] | None:
@@ -2900,25 +2973,12 @@ async def users(message: Message, settings: Settings, supabase: Client) -> None:
         return
 
     try:
-        count_response = (
-            supabase.table("telegram_users")
-            .select("*", count="exact")
-            .execute()
-        )
-        latest_response = (
-            supabase.table("telegram_users")
-            .select("*")
-            .order("registered_at", desc=True)
-            .limit(10)
-            .execute()
-        )
+        total, latest = await asyncio.to_thread(fetch_users_summary, supabase)
     except Exception as exc:
         logger.exception("Could not fetch users")
         await message.answer(f"No pude consultar usuarios: {exc}")
         return
 
-    total = count_response.count or 0
-    latest = latest_response.data or []
     lines = [f"Usuarios registrados: {total}", "", "Últimos 10:"]
     lines.extend(format_user(row) for row in latest)
     if not latest:
@@ -2986,19 +3046,12 @@ async def unconfirmed(message: Message, settings: Settings, supabase: Client) ->
         return
 
     try:
-        response = (
-            supabase.table("telegram_users")
-            .select("*")
-            .order("registered_at", desc=True)
-            .limit(500)
-            .execute()
-        )
+        rows = await asyncio.to_thread(fetch_unconfirmed_users, supabase)
     except Exception as exc:
         logger.exception("Could not fetch unconfirmed users")
         await message.answer(f"No pude consultar no confirmados: {exc}")
         return
 
-    rows = [row for row in (response.data or []) if row.get("confirmed_subscription") is not True]
     lines = [f"Usuarios sin confirmación: {len(rows)}"]
     lines.extend(format_user(row) for row in rows[:50])
     if len(rows) > 50:
@@ -3014,19 +3067,11 @@ async def pending_payments(message: Message, settings: Settings, supabase: Clien
         await reject_non_admin(message)
         return
     try:
-        response = (
-            supabase.table("telegram_users")
-            .select("*")
-            .eq("payment_status", "pending_review")
-            .order("pending_payment_at", desc=True)
-            .limit(100)
-            .execute()
-        )
+        rows = await asyncio.to_thread(fetch_pending_payment_users, supabase)
     except Exception as exc:
         logger.exception("Could not fetch pending payments")
         await message.answer(f"No pude consultar pagos pendientes: {exc}")
         return
-    rows = response.data or []
     lines = [f"Pagos pendientes: {len(rows)}"]
     lines.extend(format_user(row) for row in rows)
     if not rows:
@@ -3588,19 +3633,14 @@ async def set_expiry(message: Message, settings: Settings, supabase: Client) -> 
         return
 
     try:
-        existing = get_registered_user(supabase, telegram_id)
-        if not existing:
-            await message.answer("Usuario no encontrado en telegram_users.")
-            return
-        (
-            supabase.table("telegram_users")
-            .update({"expiry_date": expiry})
-            .eq("telegram_id", telegram_id)
-            .execute()
-        )
+        updated = await asyncio.to_thread(set_user_expiry_date, supabase, telegram_id, expiry)
     except Exception as exc:
         logger.exception("Could not set expiry for telegram_id=%s", telegram_id)
         await message.answer(f"No pude actualizar la fecha: {exc}")
+        return
+
+    if not updated:
+        await message.answer("Usuario no encontrado en telegram_users.")
         return
 
     await message.answer(f"Vencimiento actualizado: {telegram_id} -> {expiry}")
@@ -4513,6 +4553,53 @@ async def handle_error(event: ErrorEvent) -> None:
     logger.exception("Unhandled update error: %s", event.exception)
 
 
+def get_bot_state(supabase: Client, key: str) -> str | None:
+    try:
+        response = (
+            supabase.table("bot_state")
+            .select("value")
+            .eq("key", key)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return response.data[0].get("value")
+    except Exception:
+        logger.warning("Could not read bot_state key=%s", key, exc_info=True)
+    return None
+
+
+def set_bot_state(supabase: Client, key: str, value: str) -> None:
+    try:
+        (
+            supabase.table("bot_state")
+            .upsert({"key": key, "value": value, "updated_at": now_utc_iso()}, on_conflict="key")
+            .execute()
+        )
+    except Exception:
+        logger.warning("Could not write bot_state key=%s", key, exc_info=True)
+
+
+DAILY_NOTICE_STATE_KEY = "last_daily_notice_date"
+
+
+async def run_daily_notice_if_needed(bot: Bot, supabase: Client, settings: Settings) -> None:
+    """Runs notify_expiring_today at most once per calendar day (Mexico City).
+
+    Called both from the 09:00 cron job and once at bot startup, so a missed
+    9am run (e.g. Railway restarted the process around that time) still gets
+    caught the same day instead of silently skipping that day's reminders.
+    Guarded by bot_state so repeated restarts on the same day don't resend.
+    """
+    today = today_iso()
+    last_run = await asyncio.to_thread(get_bot_state, supabase, DAILY_NOTICE_STATE_KEY)
+    if last_run == today:
+        logger.info("Daily renewal notice already sent today (%s); skipping", today)
+        return
+    await notify_expiring_today(bot, supabase, settings)
+    await asyncio.to_thread(set_bot_state, supabase, DAILY_NOTICE_STATE_KEY, today)
+
+
 async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) -> None:
     today = datetime.now(APP_TIMEZONE).date()
     try:
@@ -4520,15 +4607,7 @@ async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) 
         for notice_day in settings.renewal_notice_days:
             target = (today + timedelta(days=notice_day)).isoformat()
             column = f"renewal_notice_{notice_day}d_sent_at"
-            response = (
-                supabase.table("telegram_users")
-                .select("*")
-                .eq("status", "active")
-                .eq("expiry_date", target)
-                .is_(column, "null")
-                .execute()
-            )
-            rows = response.data or []
+            rows = await asyncio.to_thread(fetch_users_for_notice_day, supabase, target, column)
             if rows:
                 sections.append(f"Expiran en {notice_day} días ({target}): {len(rows)}")
                 sections.extend(format_user(row) for row in rows)
@@ -4562,12 +4641,7 @@ async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) 
                         failed_ids.append(str(telegram_id))
 
                 if sent_ids:
-                    (
-                        supabase.table("telegram_users")
-                        .update({column: now_utc_iso()})
-                        .in_("telegram_id", sent_ids)
-                        .execute()
-                    )
+                    await asyncio.to_thread(mark_notice_sent, supabase, column, sent_ids)
                 sections.append(f"DMs enviados para aviso {notice_day}d: {len(sent_ids)}/{len(rows)}")
                 if failed_ids:
                     sections.append(f"Fallidos aviso {notice_day}d: {', '.join(failed_ids)}")
@@ -4610,7 +4684,7 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
 
     scheduler = AsyncIOScheduler(timezone=APP_TIMEZONE)
     scheduler.add_job(
-        notify_expiring_today,
+        run_daily_notice_if_needed,
         CronTrigger(hour=9, minute=0, timezone=APP_TIMEZONE),
         args=[bot, supabase, settings],
         id="daily_expiry_notification",
@@ -4618,6 +4692,11 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
         max_instances=1,
     )
     scheduler.start()
+
+    asyncio.create_task(
+        run_daily_notice_if_needed(bot, supabase, settings),
+        name="daily-notice-startup-catchup",
+    )
 
     logger.info("Starting Telegram bot polling")
     try:
