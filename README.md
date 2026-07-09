@@ -91,6 +91,66 @@ create index if not exists payment_history_created_at_idx
 
 create index if not exists payment_history_payment_status_idx
   on payment_history (payment_status);
+
+create table if not exists access_channels (
+  channel_key text primary key,
+  label text not null,
+  chat_id text not null,
+  active boolean default true,
+  is_active boolean default true,
+  expires_membership boolean default false,
+  has_expiry boolean default false,
+  created_at timestamptz default now()
+);
+
+create table if not exists user_channel_access (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  channel_key text not null,
+  channel_label text,
+  chat_id text,
+  invite_link text,
+  invite_link_name text,
+  invite_link_created_at timestamptz,
+  invite_link_revoked boolean default false,
+  invite_link_used boolean default false,
+  status text default 'active',
+  access_status text default 'active',
+  granted_at timestamptz,
+  joined_channel_at timestamptz,
+  expires_at date,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique (telegram_id, channel_key)
+);
+
+create index if not exists user_channel_access_telegram_id_idx
+  on user_channel_access (telegram_id);
+
+create index if not exists user_channel_access_channel_key_idx
+  on user_channel_access (channel_key);
+
+create table if not exists manual_invite_links (
+  id bigserial primary key,
+  channel_code text,
+  telegram_chat_id text,
+  invite_link text,
+  invite_link_name text,
+  created_by_admin_id bigint,
+  created_at timestamptz default now(),
+  expires_at timestamptz,
+  used_by_telegram_id bigint,
+  used_at timestamptz,
+  revoked boolean default false,
+  revoked_at timestamptz,
+  notes text
+);
+
+create index if not exists manual_invite_links_invite_link_idx
+  on manual_invite_links (invite_link);
+
+create index if not exists manual_invite_links_channel_code_idx
+  on manual_invite_links (channel_code);
 ```
 
 For existing tables, `/sync_schema` and startup migration attempt to run:
@@ -183,6 +243,78 @@ create index if not exists payment_history_created_at_idx
   on public.payment_history (created_at desc);
 create index if not exists payment_history_payment_status_idx
   on public.payment_history (payment_status);
+create table if not exists public.access_channels (
+  channel_key text primary key,
+  label text not null,
+  chat_id text not null,
+  active boolean default true,
+  expires_membership boolean default false,
+  created_at timestamptz default now()
+);
+alter table public.access_channels add column if not exists label text;
+alter table public.access_channels add column if not exists chat_id text;
+alter table public.access_channels add column if not exists active boolean default true;
+alter table public.access_channels add column if not exists is_active boolean default true;
+alter table public.access_channels add column if not exists expires_membership boolean default false;
+alter table public.access_channels add column if not exists has_expiry boolean default false;
+alter table public.access_channels add column if not exists created_at timestamptz default now();
+create table if not exists public.user_channel_access (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  channel_key text not null,
+  channel_label text,
+  chat_id text,
+  invite_link text,
+  invite_link_name text,
+  invite_link_created_at timestamptz,
+  invite_link_revoked boolean default false,
+  invite_link_used boolean default false,
+  access_status text default 'active',
+  granted_at timestamptz,
+  expires_at date,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique (telegram_id, channel_key)
+);
+alter table public.user_channel_access add column if not exists telegram_id bigint;
+alter table public.user_channel_access add column if not exists channel_key text;
+alter table public.user_channel_access add column if not exists channel_label text;
+alter table public.user_channel_access add column if not exists chat_id text;
+alter table public.user_channel_access add column if not exists invite_link text;
+alter table public.user_channel_access add column if not exists invite_link_name text;
+alter table public.user_channel_access add column if not exists invite_link_created_at timestamptz;
+alter table public.user_channel_access add column if not exists invite_link_revoked boolean default false;
+alter table public.user_channel_access add column if not exists invite_link_used boolean default false;
+alter table public.user_channel_access add column if not exists status text default 'active';
+alter table public.user_channel_access add column if not exists access_status text default 'active';
+alter table public.user_channel_access add column if not exists granted_at timestamptz;
+alter table public.user_channel_access add column if not exists joined_channel_at timestamptz;
+alter table public.user_channel_access add column if not exists expires_at date;
+alter table public.user_channel_access add column if not exists created_at timestamptz default now();
+alter table public.user_channel_access add column if not exists updated_at timestamptz default now();
+create index if not exists user_channel_access_telegram_id_idx
+  on public.user_channel_access (telegram_id);
+create index if not exists user_channel_access_channel_key_idx
+  on public.user_channel_access (channel_key);
+create table if not exists public.manual_invite_links (
+  id bigserial primary key,
+  channel_code text,
+  telegram_chat_id text,
+  invite_link text,
+  invite_link_name text,
+  created_by_admin_id bigint,
+  created_at timestamptz default now(),
+  expires_at timestamptz,
+  used_by_telegram_id bigint,
+  used_at timestamptz,
+  revoked boolean default false,
+  revoked_at timestamptz,
+  notes text
+);
+create index if not exists manual_invite_links_invite_link_idx
+  on public.manual_invite_links (invite_link);
+create index if not exists manual_invite_links_channel_code_idx
+  on public.manual_invite_links (channel_code);
 ```
 
 Supabase REST does not expose DDL by default. To let the bot run this automatically, create a tightly controlled `exec_sql` RPC for your server-side service role, or run the SQL manually in the Supabase SQL editor.
@@ -235,10 +367,12 @@ The local web dashboard runs on `http://localhost:8080` unless `PORT` is set.
 /send_poll
 /send_confirm_subscription
 /users
+/chat_id
 /pending_payments
 /user <telegram_id>
 /payment_history <telegram_id>
 /send_invite <telegram_id>
+/manual_open_link CHANNEL_CODE
 /revoke_invite <telegram_id>
 /revoke_user <telegram_id>
 /revoke_link <invite_link_name>
@@ -318,6 +452,33 @@ The dashboard stores signed session cookies and does not expose the Supabase ser
 ## Payment approval and renewal jobs
 
 Users send payment receipts to the bot in private chat as a photo or document. The bot marks them `pending_review` and sends admin buttons to `ADMIN_CHAT_ID`. If a user sends another receipt while still pending review, the bot replaces the stored receipt reference and does not send another admin alert or create another approval button. Invite links are generated and sent only after an admin approves the payment.
+
+Multi-channel approval:
+
+- Pending payment admin messages include channel selection buttons before approval.
+- `Grupo` is the existing `CONTENT_CHANNEL_ID` channel and keeps membership expiration, renewal reminders, and expired-user removal.
+- `Lady in Red` appears when `access_channels.channel_key='lady_in_red'` has `is_active=true`; it does not expire and does not trigger renewal reminders.
+- `has_expiry` controls renewal/expiry logic only. It does not control button visibility.
+- Channels without an active `access_channels` row are hidden from the pending-payment approval buttons.
+- Generated links for every selected channel are stored separately in `user_channel_access`.
+- Use `/chat_id` in a channel or group to send its chat ID and title to `ADMIN_CHAT_ID` before adding it to `access_channels`.
+- Use `/manual_open_link CHANNEL_CODE` to create a one-hour, one-use invite link for an active channel when you do not know the user's Telegram ID yet. The link is sent only to `ADMIN_CHAT_ID`, saved in `manual_invite_links`, and does not create payment history or mark anyone paid.
+- When a user joins with a manual open link, the bot records the Telegram user, marks the manual link as used, creates `user_channel_access`, and notifies `ADMIN_CHAT_ID`.
+- If a joining user is blacklisted in `telegram_users` or `blacklisted_users`, the bot bans them immediately and notifies `ADMIN_CHAT_ID`.
+
+Example `access_channels` rows:
+
+```sql
+insert into public.access_channels (channel_key, label, chat_id, is_active, has_expiry)
+values
+  ('grupo', 'Grupo', '-1001234567890', true, true),
+  ('lady_in_red', 'Lady in Red', '-1009876543210', true, false)
+on conflict (channel_key) do update
+set label = excluded.label,
+    chat_id = excluded.chat_id,
+    is_active = excluded.is_active,
+    has_expiry = excluded.has_expiry;
+```
 
 Payment history:
 

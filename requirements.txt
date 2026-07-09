@@ -7,3 +7,5 @@ uvicorn
 jinja2
 python-multipart
 itsdangerous
+telethon
+anthropic
