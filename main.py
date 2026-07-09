@@ -2037,6 +2037,19 @@ def renewal_broadcast_text(expiry_date: Any) -> str:
     )
 
 
+def scheduled_renewal_notice_text(expiry_date: Any) -> str:
+    expiry = str(expiry_date or "-")
+    return (
+        "Hola bebé 💕\n\n"
+        f"Solo paso a recordarte que tu membresía vence el {expiry}. "
+        "Te aviso con anticipación para evitar que se te junte al final. ✨\n\n"
+        "En caso de no recibir tu renovación antes de esa fecha, tu acceso al canal será removido "
+        "automáticamente al día siguiente.\n\n"
+        "Si necesitas datos para transferencia o link de pago con tarjeta, házmelo saber y con gusto te los envío. 💖\n\n"
+        "¡Gracias, bebé! 😘"
+    )
+
+
 def insert_renewal_message_recipient(supabase: Client, row: dict[str, Any]) -> None:
     try:
         supabase.table("renewal_message_recipients").insert(
@@ -4519,13 +4532,45 @@ async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) 
             if rows:
                 sections.append(f"Expiran en {notice_day} días ({target}): {len(rows)}")
                 sections.extend(format_user(row) for row in rows)
-                ids = [row["telegram_id"] for row in rows]
-                (
-                    supabase.table("telegram_users")
-                    .update({column: now_utc_iso()})
-                    .in_("telegram_id", ids)
-                    .execute()
-                )
+                sent_ids: list[int] = []
+                failed_ids: list[str] = []
+                for row in rows:
+                    telegram_id = row.get("telegram_id")
+                    if telegram_id is None:
+                        failed_ids.append("-")
+                        continue
+                    try:
+                        await bot.send_message(
+                            int(telegram_id),
+                            scheduled_renewal_notice_text(row.get("expiry_date")),
+                        )
+                        sent_ids.append(int(telegram_id))
+                    except (TelegramBadRequest, TelegramForbiddenError):
+                        logger.warning(
+                            "Could not DM scheduled renewal notice telegram_id=%s notice_day=%s",
+                            telegram_id,
+                            notice_day,
+                            exc_info=True,
+                        )
+                        failed_ids.append(str(telegram_id))
+                    except Exception:
+                        logger.exception(
+                            "Unexpected scheduled renewal notice failure telegram_id=%s notice_day=%s",
+                            telegram_id,
+                            notice_day,
+                        )
+                        failed_ids.append(str(telegram_id))
+
+                if sent_ids:
+                    (
+                        supabase.table("telegram_users")
+                        .update({column: now_utc_iso()})
+                        .in_("telegram_id", sent_ids)
+                        .execute()
+                    )
+                sections.append(f"DMs enviados para aviso {notice_day}d: {len(sent_ids)}/{len(rows)}")
+                if failed_ids:
+                    sections.append(f"Fallidos aviso {notice_day}d: {', '.join(failed_ids)}")
 
         expired_rows = await asyncio.to_thread(expired_active_users, supabase)
         sections.append(f"Usuarios activos expirados: {len(expired_rows)}")
