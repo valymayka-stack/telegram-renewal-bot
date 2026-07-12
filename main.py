@@ -3152,8 +3152,13 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
 
     username = f"@{user.username}" if user.username else "-"
     cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, user.id)
-    admin_text = (
-        "Nuevo comprobante pendiente\n"
+    admin_text = "Nuevo comprobante pendiente\n"
+    if cart_keys:
+        cart_channels_list = cart_channels(
+            await asyncio.to_thread(get_access_channels, supabase, settings), cart_keys
+        )
+        admin_text += f"💰 Monto esperado: ${cart_total(cart_channels_list):.0f} MXN\n\n"
+    admin_text += (
         f"telegram_id: {user.id}\n"
         f"username: {username}\n"
         f"first_name: {user.first_name or '-'}\n"
@@ -3161,9 +3166,6 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         f"pending_payment_at: {now}"
     )
     if cart_keys:
-        cart_channels_list = cart_channels(
-            await asyncio.to_thread(get_access_channels, supabase, settings), cart_keys
-        )
         admin_text += "\n\nCarrito del cliente:\n" + cart_summary_text(cart_channels_list)
     try:
         copied_receipt = await message.bot.copy_message(
