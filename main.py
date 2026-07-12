@@ -804,15 +804,6 @@ def remove_cart_item(supabase: Client, telegram_id: int, channel_key: str) -> No
     )
 
 
-def clear_cart(supabase: Client, telegram_id: int) -> None:
-    (
-        supabase.table("cart_items")
-        .delete()
-        .eq("telegram_id", telegram_id)
-        .execute()
-    )
-
-
 def cart_channels(channels: list[dict[str, Any]], cart_keys: set[str]) -> list[dict[str, Any]]:
     return [channel for channel in channels if channel_code(channel) in cart_keys]
 
@@ -2075,6 +2066,8 @@ async def approve_payment(
         existing_user.get("username") if existing_user else None,
         existing_user.get("first_name") if existing_user else None,
     )
+    for channel in selected_channels:
+        await asyncio.to_thread(remove_cart_item, supabase, telegram_id, channel_code(channel))
     dm_sent = await send_channel_invites_to_user(bot, telegram_id, channel_links)
     if dm_sent:
         await bot.send_message(settings.admin_chat_id, f"Pago aprobado y link enviado a {telegram_id}")
@@ -3185,8 +3178,6 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
             ),
         )
         PENDING_PAYMENT_ADMIN_MESSAGES[(admin_message.chat.id, admin_message.message_id)] = copied_receipt.message_id
-        if cart_keys:
-            await asyncio.to_thread(clear_cart, supabase, user.id)
         logger.info("Payment receipt submitted telegram_id=%s cart_size=%s", user.id, len(cart_keys))
     except Exception:
         logger.exception("Could not notify admin about payment receipt telegram_id=%s", user.id)
