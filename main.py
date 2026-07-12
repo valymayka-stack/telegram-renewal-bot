@@ -90,6 +90,7 @@ GRUPO_CHANNEL_KEY = "grupo"
 GRUPO_CHANNEL_LABEL = "Grupo"
 LADY_CHANNEL_KEY = "lady_in_red"
 LADY_CHANNEL_LABEL = "Lady in Red"
+GRUPO_BUNDLED_CHANNEL_KEYS = {"nuevos_sus", "blue_love"}
 DATE_FORMAT = "%Y-%m-%d"
 APP_TIMEZONE = ZoneInfo("America/Mexico_City")
 SCHEMA_MIGRATION_SQL = """
@@ -1857,6 +1858,8 @@ async def approve_payment(
 ) -> dict[str, Any]:
     existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
     requested_keys = selected_channel_keys_for_approval(selected_channel_keys)
+    if GRUPO_CHANNEL_KEY in requested_keys:
+        requested_keys = requested_keys | GRUPO_BUNDLED_CHANNEL_KEYS
     available_channels = await asyncio.to_thread(get_access_channels, supabase, settings)
     selected_channels = [
         channel
