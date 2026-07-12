@@ -91,6 +91,7 @@ GRUPO_CHANNEL_LABEL = "Grupo"
 LADY_CHANNEL_KEY = "lady_in_red"
 LADY_CHANNEL_LABEL = "Lady in Red"
 GRUPO_BUNDLED_CHANNEL_KEYS = {"nuevos_sus", "blue_love"}
+CART_CATEGORIES = {"eterea": "Etérea", "casera": "Casera"}
 DATE_FORMAT = "%Y-%m-%d"
 APP_TIMEZONE = ZoneInfo("America/Mexico_City")
 SCHEMA_MIGRATION_SQL = """
@@ -290,6 +291,16 @@ create table if not exists public.bot_state (
   value text,
   updated_at timestamptz default now()
 );
+alter table public.access_channels add column if not exists price numeric;
+alter table public.access_channels add column if not exists category text;
+create table if not exists public.cart_items (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  channel_key text not null,
+  added_at timestamptz default now(),
+  unique (telegram_id, channel_key)
+);
+create index if not exists cart_items_telegram_id_idx on public.cart_items (telegram_id);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -716,6 +727,32 @@ def channel_telegram_chat_id(channel: dict[str, Any]) -> Any:
     return channel.get("telegram_chat_id") or channel.get("chat_id")
 
 
+def channel_price(channel: dict[str, Any]) -> float | None:
+    price = channel.get("price")
+    if price is None:
+        return None
+    try:
+        return float(price)
+    except (TypeError, ValueError):
+        return None
+
+
+def channel_category(channel: dict[str, Any]) -> str | None:
+    category = channel.get("category")
+    if category in CART_CATEGORIES:
+        return category
+    return None
+
+
+def is_active_member(user_row: dict[str, Any] | None) -> bool:
+    if not user_row or user_row.get("status") != "active":
+        return False
+    expiry = parse_iso_date(user_row.get("expiry_date"))
+    if expiry is None:
+        return False
+    return expiry >= datetime.now(APP_TIMEZONE).date()
+
+
 def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, Any]]:
     try:
         response = (
@@ -730,6 +767,64 @@ def get_access_channels(supabase: Client, settings: Settings) -> list[dict[str, 
     except Exception:
         logger.warning("Could not fetch approval channels from access_channels", exc_info=True)
         return []
+
+
+def get_cart_channel_keys(supabase: Client, telegram_id: int) -> set[str]:
+    try:
+        response = (
+            supabase.table("cart_items")
+            .select("channel_key")
+            .eq("telegram_id", telegram_id)
+            .execute()
+        )
+        return {row["channel_key"] for row in (response.data or [])}
+    except Exception:
+        logger.warning("Could not fetch cart items telegram_id=%s", telegram_id, exc_info=True)
+        return set()
+
+
+def add_cart_item(supabase: Client, telegram_id: int, channel_key: str) -> None:
+    (
+        supabase.table("cart_items")
+        .upsert(
+            {"telegram_id": telegram_id, "channel_key": channel_key},
+            on_conflict="telegram_id,channel_key",
+        )
+        .execute()
+    )
+
+
+def remove_cart_item(supabase: Client, telegram_id: int, channel_key: str) -> None:
+    (
+        supabase.table("cart_items")
+        .delete()
+        .eq("telegram_id", telegram_id)
+        .eq("channel_key", channel_key)
+        .execute()
+    )
+
+
+def clear_cart(supabase: Client, telegram_id: int) -> None:
+    (
+        supabase.table("cart_items")
+        .delete()
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+
+
+def cart_channels(channels: list[dict[str, Any]], cart_keys: set[str]) -> list[dict[str, Any]]:
+    return [channel for channel in channels if channel_code(channel) in cart_keys]
+
+
+def cart_total(channels: list[dict[str, Any]]) -> float:
+    return sum(channel_price(channel) or 0 for channel in channels)
+
+
+def channels_in_category(channels: list[dict[str, Any]], category: str) -> list[dict[str, Any]]:
+    matching = [channel for channel in channels if channel_category(channel) == category]
+    matching.sort(key=lambda channel: channel_price(channel) or 0, reverse=True)
+    return matching
 
 
 def get_access_channel_by_code(supabase: Client, requested_code: str) -> dict[str, Any] | None:
@@ -2357,6 +2452,83 @@ def mark_user_removed(supabase: Client, telegram_id: int) -> None:
     )
 
 
+def build_membership_gate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Quiero unirme al grupo", callback_data="cart:join_grupo")],
+        ]
+    )
+
+
+def build_category_picker_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Etérea", callback_data="cart:category:eterea"),
+                InlineKeyboardButton(text="Casera", callback_data="cart:category:casera"),
+            ],
+            [InlineKeyboardButton(text="Ver carrito", callback_data="cart:view")],
+        ]
+    )
+
+
+def build_category_list_keyboard(
+    category: str,
+    channels: list[dict[str, Any]],
+    cart_keys: set[str],
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for channel in channels:
+        code = channel_code(channel)
+        label = channel_label(channel)
+        price = channel_price(channel)
+        marker = "✅" if code in cart_keys else "⬜"
+        price_text = f"${price:.0f}" if price is not None else "-"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{marker} {label} — {price_text}",
+                    callback_data=f"cart:toggle:{code}",
+                )
+            ]
+        )
+    other_category = "casera" if category == "eterea" else "eterea"
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=f"Ver {CART_CATEGORIES[other_category]}",
+                callback_data=f"cart:category:{other_category}",
+            ),
+            InlineKeyboardButton(text=f"Ver carrito ({len(cart_keys)})", callback_data="cart:view"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_cart_summary_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for channel in channels:
+        code = channel_code(channel)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Quitar {channel_label(channel)}",
+                    callback_data=f"cart:remove:{code}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(text="Seguir viendo", callback_data="cart:category:eterea"),
+        ]
+    )
+    if channels:
+        rows.append(
+            [InlineKeyboardButton(text="Confirmar y pagar", callback_data="cart:checkout")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def build_cta_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2497,6 +2669,47 @@ def upsert_confirmed_subscription_user(supabase: Client, callback_query: Callbac
     payload["expiry_date"] = (membership_start_date + timedelta(days=30)).isoformat()
     supabase.table("telegram_users").insert(payload).execute()
     logger.info("Registered confirmed subscription user telegram_id=%s", user.id)
+
+
+async def can_browse_cart_catalog(
+    supabase: Client, telegram_id: int, existing_user: dict[str, Any] | None
+) -> bool:
+    if is_active_member(existing_user):
+        return True
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    return GRUPO_CHANNEL_KEY in cart_keys
+
+
+def cart_summary_text(selected: list[dict[str, Any]]) -> str:
+    lines = ["Tu carrito:"]
+    for channel in selected:
+        price = channel_price(channel)
+        price_text = f"${price:.0f}" if price is not None else "-"
+        lines.append(f"• {channel_label(channel)} — {price_text}")
+    lines.append("")
+    lines.append(f"Total: ${cart_total(selected):.0f} MXN")
+    return "\n".join(lines)
+
+
+@router.message(Command("start"))
+async def cart_start(message: Message, settings: Settings, supabase: Client) -> None:
+    if not message.from_user:
+        return
+    existing_user = await asyncio.to_thread(get_registered_user, supabase, message.from_user.id)
+    if await can_browse_cart_catalog(supabase, message.from_user.id, existing_user):
+        await message.answer(
+            "¿Qué tipo de contenido quieres ver hoy bebé? 🔥",
+            reply_markup=build_category_picker_keyboard(),
+        )
+        return
+    grupo = await asyncio.to_thread(get_access_channel_by_code, supabase, GRUPO_CHANNEL_KEY) or grupo_access_channel(settings)
+    price = channel_price(grupo)
+    price_text = f"${price:.0f} MXN/mes" if price is not None else "$300 MXN/mes"
+    await message.answer(
+        "Hola bebé 💕 Para ver los sets disponibles primero necesitas ser miembro del Grupo Exclusivo.\n\n"
+        f"💎 Grupo Exclusivo — {price_text}",
+        reply_markup=build_membership_gate_keyboard(),
+    )
 
 
 @router.message(Command("send_poll"))
@@ -2938,6 +3151,7 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
     await message.answer("Comprobante recibido ✅ Lo revisaremos manualmente.")
 
     username = f"@{user.username}" if user.username else "-"
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, user.id)
     admin_text = (
         "Nuevo comprobante pendiente\n"
         f"telegram_id: {user.id}\n"
@@ -2946,6 +3160,11 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         f"last_name: {user.last_name or '-'}\n"
         f"pending_payment_at: {now}"
     )
+    if cart_keys:
+        cart_channels_list = cart_channels(
+            await asyncio.to_thread(get_access_channels, supabase, settings), cart_keys
+        )
+        admin_text += "\n\nCarrito del cliente:\n" + cart_summary_text(cart_channels_list)
     try:
         copied_receipt = await message.bot.copy_message(
             chat_id=settings.admin_chat_id,
@@ -2960,11 +3179,13 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
                 supabase,
                 settings,
                 user.id,
-                None,
+                cart_keys or None,
             ),
         )
         PENDING_PAYMENT_ADMIN_MESSAGES[(admin_message.chat.id, admin_message.message_id)] = copied_receipt.message_id
-        logger.info("Payment receipt submitted telegram_id=%s", user.id)
+        if cart_keys:
+            await asyncio.to_thread(clear_cart, supabase, user.id)
+        logger.info("Payment receipt submitted telegram_id=%s cart_size=%s", user.id, len(cart_keys))
     except Exception:
         logger.exception("Could not notify admin about payment receipt telegram_id=%s", user.id)
 
@@ -4445,6 +4666,135 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
     except Exception as exc:
         logger.exception("Payment admin action failed action=%s telegram_id=%s", action, telegram_id)
         await callback_query.answer(f"Error: {exc}", show_alert=True)
+
+
+@router.callback_query(F.data == "cart:join_grupo")
+async def cart_join_grupo(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user or not callback_query.message:
+        return
+    telegram_id = callback_query.from_user.id
+    await asyncio.to_thread(add_cart_item, supabase, telegram_id, GRUPO_CHANNEL_KEY)
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        "Perfecto bebé, el Grupo ya quedó en tu carrito 💎\n\n¿Qué más te gustaría agregar?",
+        reply_markup=build_category_picker_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("cart:category:"))
+async def cart_show_category(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user or not callback_query.message:
+        return
+    telegram_id = callback_query.from_user.id
+    category = callback_query.data.split(":", 2)[2]
+    if category not in CART_CATEGORIES:
+        await callback_query.answer()
+        return
+    existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    if not await can_browse_cart_catalog(supabase, telegram_id, existing_user):
+        await callback_query.answer("Primero necesitas el Grupo Exclusivo bebé 💎", show_alert=True)
+        return
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    category_channels = channels_in_category(channels, category)
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        f"{CART_CATEGORIES[category]} disponible:",
+        reply_markup=build_category_list_keyboard(category, category_channels, cart_keys),
+    )
+
+
+@router.callback_query(F.data.startswith("cart:toggle:"))
+async def cart_toggle_item(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user or not callback_query.message:
+        return
+    telegram_id = callback_query.from_user.id
+    code = callback_query.data.split(":", 2)[2]
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    channel = next((c for c in channels if channel_code(c) == code), None)
+    if not channel:
+        await callback_query.answer("Canal no disponible.", show_alert=True)
+        return
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    if code in cart_keys:
+        await asyncio.to_thread(remove_cart_item, supabase, telegram_id, code)
+        cart_keys.discard(code)
+    else:
+        await asyncio.to_thread(add_cart_item, supabase, telegram_id, code)
+        cart_keys.add(code)
+    await callback_query.answer()
+    category = channel_category(channel) or "eterea"
+    category_channels = channels_in_category(channels, category)
+    await callback_query.message.edit_text(
+        f"{CART_CATEGORIES[category]} disponible:",
+        reply_markup=build_category_list_keyboard(category, category_channels, cart_keys),
+    )
+
+
+@router.callback_query(F.data == "cart:view")
+async def cart_view(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user or not callback_query.message:
+        return
+    telegram_id = callback_query.from_user.id
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    selected = cart_channels(channels, cart_keys)
+    await callback_query.answer()
+    if not selected:
+        await callback_query.message.edit_text(
+            "Tu carrito está vacío bebé.",
+            reply_markup=build_category_picker_keyboard(),
+        )
+        return
+    await callback_query.message.edit_text(
+        cart_summary_text(selected),
+        reply_markup=build_cart_summary_keyboard(selected),
+    )
+
+
+@router.callback_query(F.data.startswith("cart:remove:"))
+async def cart_remove_item(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user or not callback_query.message:
+        return
+    telegram_id = callback_query.from_user.id
+    code = callback_query.data.split(":", 2)[2]
+    await asyncio.to_thread(remove_cart_item, supabase, telegram_id, code)
+    await callback_query.answer("Quitado del carrito")
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    selected = cart_channels(channels, cart_keys)
+    if not selected:
+        await callback_query.message.edit_text(
+            "Tu carrito está vacío bebé.",
+            reply_markup=build_category_picker_keyboard(),
+        )
+        return
+    await callback_query.message.edit_text(
+        cart_summary_text(selected),
+        reply_markup=build_cart_summary_keyboard(selected),
+    )
+
+
+@router.callback_query(F.data == "cart:checkout")
+async def cart_checkout(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user or not callback_query.message:
+        return
+    telegram_id = callback_query.from_user.id
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    selected = cart_channels(channels, cart_keys)
+    await callback_query.answer()
+    if not selected:
+        await callback_query.message.edit_text(
+            "Tu carrito está vacío bebé.",
+            reply_markup=build_category_picker_keyboard(),
+        )
+        return
+    total = cart_total(selected)
+    await callback_query.message.edit_text(
+        f"Total a pagar: ${total:.0f} MXN\n\n"
+        "Manda tu comprobante de pago aquí mismo (foto o PDF) y en cuanto lo validemos te llegan tus links 🔓"
+    )
 
 
 @router.chat_member()
