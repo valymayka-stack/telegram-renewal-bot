@@ -47,6 +47,8 @@ HIDDEN_APPROVAL_CHANNEL_CODES = {
     "regalo_marcador_exacto",
     "mexico_ecuador",
     "regalo_partido",
+    "nuevos_sus",
+    "blue_love",
 }
 PREDICTION_MEX_INGLATERRA_GAME_CODE = "mex_inglaterra"
 PREDICTION_MEX_INGLATERRA_SCORES = [
@@ -1666,7 +1668,10 @@ def pending_payment_keyboard(
     telegram_id: int,
     selected_keys: set[str] | None = None,
 ) -> InlineKeyboardMarkup:
-    channels = get_access_channels(supabase, settings)
+    channels = sorted(
+        get_access_channels(supabase, settings),
+        key=lambda channel: channel_code(channel) != GRUPO_CHANNEL_KEY,
+    )
     selected = set(selected_keys or set())
     channel_rows: list[list[InlineKeyboardButton]] = []
     current_row: list[InlineKeyboardButton] = []
