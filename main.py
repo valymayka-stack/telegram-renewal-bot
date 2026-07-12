@@ -94,6 +94,17 @@ LADY_CHANNEL_KEY = "lady_in_red"
 LADY_CHANNEL_LABEL = "Lady in Red"
 GRUPO_BUNDLED_CHANNEL_KEYS = {"nuevos_sus", "blue_love"}
 CART_CATEGORIES = {"eterea": "Etérea", "casera": "Casera"}
+CART_PAYMENT_INFO = (
+    "💳 Cuenta CLABE (BBVA)\n"
+    "Silvia Montalvo\n"
+    "012700015287595938\n\n"
+    "🌎 ¿Eres extranjero?\n"
+    "Puedes hacer tu depósito directo por Felix, Xoom o Remitly.\n"
+    "Datos adicionales que te pueden pedir:\n"
+    "Estado: Guanajuato\n"
+    "Teléfono: No aplica\n"
+    "Correo: No aplica"
+)
 DATE_FORMAT = "%Y-%m-%d"
 APP_TIMEZONE = ZoneInfo("America/Mexico_City")
 SCHEMA_MIGRATION_SQL = """
@@ -4791,6 +4802,7 @@ async def cart_checkout(callback_query: CallbackQuery, settings: Settings, supab
     total = cart_total(selected)
     await callback_query.message.edit_text(
         f"Total a pagar: ${total:.0f} MXN\n\n"
+        f"{CART_PAYMENT_INFO}\n\n"
         "Manda tu comprobante de pago aquí mismo (foto o PDF) y en cuanto lo validemos te llegan tus links 🔓"
     )
 
