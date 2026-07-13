@@ -319,6 +319,7 @@ create table if not exists public.cart_items (
 create index if not exists cart_items_telegram_id_idx on public.cart_items (telegram_id);
 alter table public.access_channels add column if not exists photo_file_id text;
 alter table public.access_channels add column if not exists description text;
+alter table public.access_channels add column if not exists featured boolean default false;
 create table if not exists public.cart_reminders (
   telegram_id bigint primary key,
   reminded_at timestamptz default now()
@@ -806,6 +807,20 @@ def channel_description(channel: dict[str, Any]) -> str | None:
     return channel.get("description") or None
 
 
+CHANNEL_NEW_BADGE_DAYS = 7
+
+
+def channel_is_featured(channel: dict[str, Any]) -> bool:
+    return channel.get("featured") is True
+
+
+def channel_is_new(channel: dict[str, Any]) -> bool:
+    created_at = parse_iso_datetime(channel.get("created_at"))
+    if created_at is None:
+        return False
+    return (datetime.now(timezone.utc) - created_at) <= timedelta(days=CHANNEL_NEW_BADGE_DAYS)
+
+
 def is_active_member(user_row: dict[str, Any] | None) -> bool:
     if not user_row or user_row.get("status") != "active":
         return False
@@ -890,7 +905,7 @@ def cart_discount(channels: list[dict[str, Any]]) -> tuple[float, float, float]:
 
 def channels_in_category(channels: list[dict[str, Any]], category: str) -> list[dict[str, Any]]:
     matching = [channel for channel in channels if channel_category(channel) == category]
-    matching.sort(key=lambda channel: channel_price(channel) or 0, reverse=True)
+    matching.sort(key=lambda channel: (not channel_is_featured(channel), -(channel_price(channel) or 0)))
     return matching
 
 
@@ -1044,6 +1059,7 @@ def insert_access_channel(
     description: str,
     photo_file_id: str,
     sort_order: int,
+    featured: bool = False,
 ) -> None:
     (
         supabase.table("access_channels")
@@ -1059,8 +1075,18 @@ def insert_access_channel(
                 "price": price,
                 "description": description or None,
                 "photo_file_id": photo_file_id,
+                "featured": featured,
             }
         )
+        .execute()
+    )
+
+
+def set_channel_featured(supabase: Client, code: str, featured: bool) -> None:
+    (
+        supabase.table("access_channels")
+        .update({"featured": featured})
+        .eq("code", code)
         .execute()
     )
 
@@ -2750,7 +2776,15 @@ def carousel_caption(channel: dict[str, Any]) -> str:
     label = channel_label(channel)
     price = channel_price(channel)
     price_text = f"${price:.0f} MXN" if price is not None else "-"
-    parts = [f"{label} — {price_text}"]
+    badges = []
+    if channel_is_featured(channel):
+        badges.append("⭐ DESTACADO")
+    if channel_is_new(channel):
+        badges.append("🆕 NUEVO")
+    parts = []
+    if badges:
+        parts.append(" · ".join(badges))
+    parts.append(f"{label} — {price_text}")
     description = channel_description(channel)
     if description:
         parts.append("")
@@ -3363,13 +3397,15 @@ async def add_set_command(message: Message, settings: Settings, supabase: Client
         "chat_id: -1001234567890\n"
         "categoria: eterea o casera (déjala vacía para ocultarlo del carrito)\n"
         "precio: 750\n"
-        "descripcion: texto de la descripción"
+        "descripcion: texto de la descripción\n"
+        "destacado: si (opcional, para que aparezca primero en su categoría)"
     )
     titulo = fields.get("titulo") or fields.get("título")
     chat_id_raw = fields.get("chat_id")
     categoria = (fields.get("categoria") or fields.get("categoría") or "").strip().lower() or None
     precio_raw = fields.get("precio")
     descripcion = fields.get("descripcion") or fields.get("descripción") or ""
+    destacado = (fields.get("destacado") or "").strip().lower() in {"si", "sí", "yes", "true"}
 
     if not titulo or not chat_id_raw:
         await message.answer(f"Faltan datos obligatorios (título y chat_id).\n\n{usage}")
@@ -3412,6 +3448,7 @@ async def add_set_command(message: Message, settings: Settings, supabase: Client
             descripcion,
             photo_file_id,
             max_sort + 1,
+            destacado,
         )
     except Exception as exc:
         logger.exception("Could not create new access channel code=%s", code)
@@ -3424,9 +3461,38 @@ async def add_set_command(message: Message, settings: Settings, supabase: Client
         f"título: {titulo}\n"
         f"chat_id: {chat_id_value}\n"
         f"categoría: {categoria or 'ninguna (oculto del carrito, solo aprobación manual)'}\n"
-        f"precio: {'$' + f'{price_value:.0f}' if price_value is not None else '-'}\n\n"
+        f"precio: {'$' + f'{price_value:.0f}' if price_value is not None else '-'}\n"
+        f"destacado: {'sí' if destacado else 'no'}\n\n"
         "Recuerda: @renaaaa_bot debe ser administrador de ese canal con permiso de invitar."
     )
+
+
+@router.message(Command("feature_set"))
+async def feature_set_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Uso: /feature_set <codigo>\nCorre el comando de nuevo sobre el mismo código para quitarlo de destacado.")
+        return
+    code = parts[1].strip().lower()
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, code)
+    if not channel:
+        await message.answer(f"No encontré un canal activo con el código '{code}'.")
+        return
+    new_state = not channel_is_featured(channel)
+    try:
+        await asyncio.to_thread(set_channel_featured, supabase, code, new_state)
+    except Exception as exc:
+        logger.exception("Could not toggle featured for code=%s", code)
+        await message.answer(f"No pude actualizar: {exc}")
+        return
+    label = channel_label(channel)
+    if new_state:
+        await message.answer(f"⭐ {label} ahora está destacado.")
+    else:
+        await message.answer(f"{label} ya no está destacado.")
 
 
 @router.message(F.chat.type == "private", (F.photo | F.document))
