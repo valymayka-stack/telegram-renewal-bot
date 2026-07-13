@@ -3194,6 +3194,8 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
             ),
         )
         PENDING_PAYMENT_ADMIN_MESSAGES[(admin_message.chat.id, admin_message.message_id)] = copied_receipt.message_id
+        if cart_keys:
+            PAYMENT_CHANNEL_SELECTIONS[(admin_message.chat.id, admin_message.message_id, user.id)] = set(cart_keys)
         logger.info("Payment receipt submitted telegram_id=%s cart_size=%s", user.id, len(cart_keys))
     except Exception:
         logger.exception("Could not notify admin about payment receipt telegram_id=%s", user.id)
