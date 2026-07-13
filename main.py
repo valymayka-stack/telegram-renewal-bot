@@ -16,7 +16,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Form, Request
@@ -314,6 +314,8 @@ create table if not exists public.cart_items (
   unique (telegram_id, channel_key)
 );
 create index if not exists cart_items_telegram_id_idx on public.cart_items (telegram_id);
+alter table public.access_channels add column if not exists photo_file_id text;
+alter table public.access_channels add column if not exists description text;
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -755,6 +757,14 @@ def channel_category(channel: dict[str, Any]) -> str | None:
     if category in CART_CATEGORIES:
         return category
     return None
+
+
+def channel_photo_file_id(channel: dict[str, Any]) -> str | None:
+    return channel.get("photo_file_id") or None
+
+
+def channel_description(channel: dict[str, Any]) -> str | None:
+    return channel.get("description") or None
 
 
 def is_active_member(user_row: dict[str, Any] | None) -> bool:
@@ -2481,37 +2491,48 @@ def build_category_picker_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def build_category_list_keyboard(
+def carousel_caption(channel: dict[str, Any]) -> str:
+    label = channel_label(channel)
+    price = channel_price(channel)
+    price_text = f"${price:.0f} MXN" if price is not None else "-"
+    parts = [f"{label} — {price_text}"]
+    description = channel_description(channel)
+    if description:
+        parts.append("")
+        parts.append(description)
+    return "\n".join(parts)
+
+
+def build_carousel_keyboard(
     category: str,
-    channels: list[dict[str, Any]],
+    index: int,
+    total: int,
+    channel: dict[str, Any],
     cart_keys: set[str],
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for channel in channels:
-        code = channel_code(channel)
-        label = channel_label(channel)
-        price = channel_price(channel)
-        marker = "✅" if code in cart_keys else "⬜"
-        price_text = f"${price:.0f}" if price is not None else "-"
-        rows.append(
+    code = channel_code(channel)
+    price = channel_price(channel)
+    price_text = f"${price:.0f}" if price is not None else "-"
+    add_label = "✅ Agregado" if code in cart_keys else f"➕ Agregar {price_text}"
+    nav_row: list[InlineKeyboardButton] = []
+    if index > 0:
+        nav_row.append(InlineKeyboardButton(text="‹ Anterior", callback_data=f"carousel:nav:{category}:{index - 1}"))
+    nav_row.append(InlineKeyboardButton(text=add_label, callback_data=f"carousel:toggle:{category}:{index}"))
+    if index < total - 1:
+        nav_row.append(InlineKeyboardButton(text="Siguiente ›", callback_data=f"carousel:nav:{category}:{index + 1}"))
+    other_category = "casera" if category == "eterea" else "eterea"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            nav_row,
             [
                 InlineKeyboardButton(
-                    text=f"{marker} {label} — {price_text}",
-                    callback_data=f"cart:toggle:{code}",
-                )
-            ]
-        )
-    other_category = "casera" if category == "eterea" else "eterea"
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text=f"Ver {CART_CATEGORIES[other_category]}",
-                callback_data=f"cart:category:{other_category}",
-            ),
-            InlineKeyboardButton(text=f"Ver carrito ({len(cart_keys)})", callback_data="cart:view"),
+                    text=f"Ver {CART_CATEGORIES[other_category]}",
+                    callback_data=f"cart:category:{other_category}",
+                ),
+                InlineKeyboardButton(text=f"Ver carrito ({len(cart_keys)})", callback_data="cart:view"),
+            ],
         ]
     )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_cart_summary_keyboard(channels: list[dict[str, Any]]) -> InlineKeyboardMarkup:
@@ -4637,10 +4658,21 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             )
             if result.get("duplicate"):
                 await callback_query.answer("Ya estaba aprobado; reenvié el link existente.", show_alert=True)
+                summary = "✅ APROBADO (ya existía) — link reenviado"
             else:
                 await callback_query.answer("Aprobado ✅")
+                labels = ", ".join(item["label"] for item in result.get("channel_links", []))
+                summary = f"✅ APROBADO — Enviado a: {labels}" if labels else "✅ APROBADO"
             if selection_key:
                 PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
+            try:
+                original_text = callback_query.message.text or ""
+                await callback_query.message.edit_text(
+                    f"{original_text}\n\n{summary}",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+                )
+            except Exception:
+                logger.warning("Could not clean up approved payment message telegram_id=%s", telegram_id, exc_info=True)
         elif action == "reject":
             await reject_payment(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
             selection_key = payment_selection_key(callback_query, telegram_id)
@@ -4707,39 +4739,87 @@ async def cart_show_category(callback_query: CallbackQuery, settings: Settings, 
         return
     channels = await asyncio.to_thread(get_access_channels, supabase, settings)
     category_channels = channels_in_category(channels, category)
-    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
     await callback_query.answer()
-    await callback_query.message.edit_text(
-        f"{CART_CATEGORIES[category]} disponible:",
-        reply_markup=build_category_list_keyboard(category, category_channels, cart_keys),
-    )
+    if not category_channels:
+        await callback_query.message.answer(f"{CART_CATEGORIES[category]}: aún no hay sets disponibles.")
+        return
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    channel = category_channels[0]
+    keyboard = build_carousel_keyboard(category, 0, len(category_channels), channel, cart_keys)
+    photo = channel_photo_file_id(channel)
+    if photo:
+        await callback_query.message.answer_photo(photo, caption=carousel_caption(channel), reply_markup=keyboard)
+    else:
+        await callback_query.message.answer(carousel_caption(channel), reply_markup=keyboard)
 
 
-@router.callback_query(F.data.startswith("cart:toggle:"))
-async def cart_toggle_item(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+@router.callback_query(F.data.startswith("carousel:nav:"))
+async def carousel_nav(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
     if not callback_query.from_user or not callback_query.message:
         return
     telegram_id = callback_query.from_user.id
-    code = callback_query.data.split(":", 2)[2]
-    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
-    channel = next((c for c in channels if channel_code(c) == code), None)
-    if not channel:
-        await callback_query.answer("Canal no disponible.", show_alert=True)
+    parts = callback_query.data.split(":")
+    if len(parts) != 4:
+        await callback_query.answer()
         return
+    category = parts[2]
+    try:
+        index = int(parts[3])
+    except ValueError:
+        await callback_query.answer()
+        return
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    category_channels = channels_in_category(channels, category)
+    if not (0 <= index < len(category_channels)):
+        await callback_query.answer()
+        return
+    cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+    channel = category_channels[index]
+    keyboard = build_carousel_keyboard(category, index, len(category_channels), channel, cart_keys)
+    photo = channel_photo_file_id(channel)
+    await callback_query.answer()
+    if photo:
+        await callback_query.message.edit_media(
+            media=InputMediaPhoto(media=photo, caption=carousel_caption(channel)),
+            reply_markup=keyboard,
+        )
+    else:
+        await callback_query.message.edit_caption(caption=carousel_caption(channel), reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("carousel:toggle:"))
+async def carousel_toggle(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user or not callback_query.message:
+        return
+    telegram_id = callback_query.from_user.id
+    parts = callback_query.data.split(":")
+    if len(parts) != 4:
+        await callback_query.answer()
+        return
+    category = parts[2]
+    try:
+        index = int(parts[3])
+    except ValueError:
+        await callback_query.answer()
+        return
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    category_channels = channels_in_category(channels, category)
+    if not (0 <= index < len(category_channels)):
+        await callback_query.answer()
+        return
+    channel = category_channels[index]
+    code = channel_code(channel)
     cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
     if code in cart_keys:
         await asyncio.to_thread(remove_cart_item, supabase, telegram_id, code)
         cart_keys.discard(code)
+        await callback_query.answer("Quitado del carrito")
     else:
         await asyncio.to_thread(add_cart_item, supabase, telegram_id, code)
         cart_keys.add(code)
-    await callback_query.answer()
-    category = channel_category(channel) or "eterea"
-    category_channels = channels_in_category(channels, category)
-    await callback_query.message.edit_text(
-        f"{CART_CATEGORIES[category]} disponible:",
-        reply_markup=build_category_list_keyboard(category, category_channels, cart_keys),
-    )
+        await callback_query.answer("Agregado al carrito ✅")
+    keyboard = build_carousel_keyboard(category, index, len(category_channels), channel, cart_keys)
+    await callback_query.message.edit_reply_markup(reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "cart:view")
