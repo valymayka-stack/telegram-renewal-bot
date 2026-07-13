@@ -925,6 +925,23 @@ def save_manual_invite_link(
     )
 
 
+def find_payment_history_recipient_by_link(supabase: Client, invite_link_value: str) -> int | None:
+    try:
+        response = (
+            supabase.table("payment_history")
+            .select("telegram_id, created_at")
+            .ilike("invite_link", f"%{invite_link_value}%")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return int(response.data[0]["telegram_id"])
+    except Exception:
+        logger.warning("Could not look up payment_history recipient for invite link", exc_info=True)
+    return None
+
+
 def get_manual_invite_by_link(supabase: Client, invite_link: str) -> dict[str, Any] | None:
     response = (
         supabase.table("manual_invite_links")
@@ -4963,6 +4980,23 @@ async def track_channel_membership(update: ChatMemberUpdated, bot: Bot, settings
                     channel_code(access_channel),
                 )
                 return
+            expected_telegram_id = await asyncio.to_thread(
+                find_payment_history_recipient_by_link, supabase, invite_link_value
+            )
+            username = f"@{user.username}" if user.username else "(sin username)"
+            if expected_telegram_id is None:
+                verdict = f"ℹ️ Link usado por telegram_id: {user.id} (no encontré a quién se le generó)"
+            elif expected_telegram_id == user.id:
+                verdict = f"✅ Link usado correctamente — telegram_id: {user.id}"
+            else:
+                verdict = (
+                    f"⚠️ POSIBLE LINK COMPARTIDO — se generó para {expected_telegram_id}, "
+                    f"pero lo usó {user.id}"
+                )
+            await bot.send_message(
+                settings.admin_chat_id,
+                f"{verdict}\nCanal: {channel_label(access_channel)}\nUsuario: {username}",
+            )
     elif new_status in left_statuses:
         existing = await asyncio.to_thread(get_registered_user, supabase, user.id)
         current = bool(existing and existing.get("payment_status") == "paid" and days_remaining(existing.get("expiry_date")) is not None and days_remaining(existing.get("expiry_date")) >= 0)
