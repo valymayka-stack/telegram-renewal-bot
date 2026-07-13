@@ -989,6 +989,95 @@ def get_access_channel_by_code(supabase: Client, requested_code: str) -> dict[st
     return None
 
 
+def slugify_channel_code(title: str) -> str:
+    text = title.lower().replace("&", "")
+    chars: list[str] = []
+    for ch in text:
+        if ch.isalnum():
+            chars.append(ch)
+        elif ch in (" ", "-", "_"):
+            chars.append("_")
+    slug = "".join(chars)
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug.strip("_")
+
+
+def access_channel_code_exists(supabase: Client, code: str) -> bool:
+    try:
+        response = (
+            supabase.table("access_channels")
+            .select("code")
+            .eq("code", code)
+            .limit(1)
+            .execute()
+        )
+        return bool(response.data)
+    except Exception:
+        logger.warning("Could not check if access channel code exists code=%s", code, exc_info=True)
+        return False
+
+
+def get_max_access_channel_sort_order(supabase: Client) -> int:
+    try:
+        response = (
+            supabase.table("access_channels")
+            .select("sort_order")
+            .order("sort_order", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return int(response.data[0].get("sort_order") or 0)
+    except Exception:
+        logger.warning("Could not fetch max sort_order", exc_info=True)
+    return 0
+
+
+def insert_access_channel(
+    supabase: Client,
+    code: str,
+    title: str,
+    chat_id_value: int,
+    category: str | None,
+    price: float | None,
+    description: str,
+    photo_file_id: str,
+    sort_order: int,
+) -> None:
+    (
+        supabase.table("access_channels")
+        .insert(
+            {
+                "code": code,
+                "title": title,
+                "telegram_chat_id": chat_id_value,
+                "has_expiry": False,
+                "is_active": True,
+                "sort_order": sort_order,
+                "category": category,
+                "price": price,
+                "description": description or None,
+                "photo_file_id": photo_file_id,
+            }
+        )
+        .execute()
+    )
+
+
+def parse_add_set_caption(caption: str) -> dict[str, str] | None:
+    lines = (caption or "").strip().split("\n")
+    if not lines or not lines[0].strip().startswith("/add_set"):
+        return None
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+    return fields
+
+
 def available_access_channel_codes(supabase: Client, settings: Settings) -> str:
     channels = get_access_channels(supabase, settings)
     codes = [channel_code(channel) for channel in channels if channel_code(channel)]
@@ -3257,6 +3346,86 @@ async def raffle_trigger_text(message: Message, settings: Settings, supabase: Cl
     await message.answer(
         "¿Cuántos boletos deseas?",
         reply_markup=raffle_quantity_keyboard(int(raffle["id"]), int(raffle.get("max_tickets_per_user") or 5)),
+    )
+
+
+@router.message(F.chat.type == "private", F.photo, F.caption.startswith("/add_set"))
+async def add_set_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        return
+    fields = parse_add_set_caption(message.caption or "")
+    if fields is None:
+        return
+    usage = (
+        "Formato:\n\n"
+        "/add_set\n"
+        "titulo: Nombre del set\n"
+        "chat_id: -1001234567890\n"
+        "categoria: eterea o casera (déjala vacía para ocultarlo del carrito)\n"
+        "precio: 750\n"
+        "descripcion: texto de la descripción"
+    )
+    titulo = fields.get("titulo") or fields.get("título")
+    chat_id_raw = fields.get("chat_id")
+    categoria = (fields.get("categoria") or fields.get("categoría") or "").strip().lower() or None
+    precio_raw = fields.get("precio")
+    descripcion = fields.get("descripcion") or fields.get("descripción") or ""
+
+    if not titulo or not chat_id_raw:
+        await message.answer(f"Faltan datos obligatorios (título y chat_id).\n\n{usage}")
+        return
+    try:
+        chat_id_value = int(chat_id_raw)
+    except ValueError:
+        await message.answer(f"chat_id inválido, debe ser un número como -1001234567890.\n\n{usage}")
+        return
+    if categoria and categoria not in CART_CATEGORIES:
+        await message.answer(f"Categoría inválida: '{categoria}'. Usa 'eterea', 'casera', o déjala vacía.")
+        return
+    price_value: float | None = None
+    if precio_raw:
+        try:
+            price_value = float(precio_raw)
+        except ValueError:
+            await message.answer("Precio inválido, debe ser un número como 750.")
+            return
+
+    code = slugify_channel_code(titulo)
+    if not code:
+        await message.answer("No pude generar un código válido a partir del título.")
+        return
+    if await asyncio.to_thread(access_channel_code_exists, supabase, code):
+        await message.answer(f"Ya existe un canal con el código '{code}'. Usa un título distinto.")
+        return
+
+    photo_file_id = message.photo[-1].file_id
+    try:
+        max_sort = await asyncio.to_thread(get_max_access_channel_sort_order, supabase)
+        await asyncio.to_thread(
+            insert_access_channel,
+            supabase,
+            code,
+            titulo,
+            chat_id_value,
+            categoria,
+            price_value,
+            descripcion,
+            photo_file_id,
+            max_sort + 1,
+        )
+    except Exception as exc:
+        logger.exception("Could not create new access channel code=%s", code)
+        await message.answer(f"No pude crear el canal: {exc}")
+        return
+
+    await message.answer(
+        "✅ Canal creado\n"
+        f"código: {code}\n"
+        f"título: {titulo}\n"
+        f"chat_id: {chat_id_value}\n"
+        f"categoría: {categoria or 'ninguna (oculto del carrito, solo aprobación manual)'}\n"
+        f"precio: {'$' + f'{price_value:.0f}' if price_value is not None else '-'}\n\n"
+        "Recuerda: @renaaaa_bot debe ser administrador de ese canal con permiso de invitar."
     )
 
 
