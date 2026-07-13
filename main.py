@@ -5306,7 +5306,7 @@ async def run_daily_notice_if_needed(bot: Bot, supabase: Client, settings: Setti
 
 async def send_cart_abandonment_reminders(bot: Bot, supabase: Client, settings: Settings) -> None:
     try:
-        stale_ids = await asyncio.to_thread(get_stale_cart_telegram_ids, supabase, 120)
+        stale_ids = await asyncio.to_thread(get_stale_cart_telegram_ids, supabase, 24 * 60)
         if not stale_ids:
             return
         already = await asyncio.to_thread(already_reminded_telegram_ids, supabase, stale_ids)
@@ -5434,7 +5434,7 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
     )
     scheduler.add_job(
         send_cart_abandonment_reminders,
-        IntervalTrigger(minutes=30),
+        IntervalTrigger(hours=1),
         args=[bot, supabase, settings],
         id="cart_abandonment_reminders",
         replace_existing=True,
