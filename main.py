@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
@@ -94,6 +95,8 @@ LADY_CHANNEL_KEY = "lady_in_red"
 LADY_CHANNEL_LABEL = "Lady in Red"
 GRUPO_BUNDLED_CHANNEL_KEYS = {"nuevos_sus", "blue_love"}
 CART_CATEGORIES = {"eterea": "Etérea", "casera": "Casera"}
+CART_DISCOUNT_MIN_SETS = 3
+CART_DISCOUNT_RATE = 0.10
 CART_PAYMENT_INFO = (
     "💳 Cuenta CLABE (BBVA)\n"
     "Silvia Montalvo\n"
@@ -316,6 +319,10 @@ create table if not exists public.cart_items (
 create index if not exists cart_items_telegram_id_idx on public.cart_items (telegram_id);
 alter table public.access_channels add column if not exists photo_file_id text;
 alter table public.access_channels add column if not exists description text;
+create table if not exists public.cart_reminders (
+  telegram_id bigint primary key,
+  reminded_at timestamptz default now()
+);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -682,6 +689,38 @@ def get_payment_history(supabase: Client, telegram_id: int, limit: int | None = 
     return rows
 
 
+def fetch_all_approved_payment_history(supabase: Client) -> list[dict[str, Any]]:
+    all_rows: list[dict[str, Any]] = []
+    offset = 0
+    page_size = 1000
+    while True:
+        response = (
+            supabase.table("payment_history")
+            .select("telegram_id, invite_link, created_at")
+            .eq("action", "approved")
+            .order("id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = response.data or []
+        all_rows.extend(rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    return all_rows
+
+
+def parse_channel_labels_from_invite_text(invite_link_text: str) -> list[str]:
+    labels: list[str] = []
+    for line in (invite_link_text or "").split("\n"):
+        line = line.strip()
+        if ":" in line:
+            label = line.split(":", 1)[0].strip()
+            if label:
+                labels.append(label)
+    return labels
+
+
 def payment_history_telegram_ids(supabase: Client) -> set[int]:
     response = (
         supabase.table("payment_history")
@@ -815,6 +854,10 @@ def add_cart_item(supabase: Client, telegram_id: int, channel_key: str) -> None:
         )
         .execute()
     )
+    try:
+        supabase.table("cart_reminders").delete().eq("telegram_id", telegram_id).execute()
+    except Exception:
+        logger.warning("Could not reset cart reminder telegram_id=%s", telegram_id, exc_info=True)
 
 
 def remove_cart_item(supabase: Client, telegram_id: int, channel_key: str) -> None:
@@ -835,10 +878,83 @@ def cart_total(channels: list[dict[str, Any]]) -> float:
     return sum(channel_price(channel) or 0 for channel in channels)
 
 
+def cart_discount(channels: list[dict[str, Any]]) -> tuple[float, float, float]:
+    """Returns (subtotal, discount_amount, total). 10% off sets (not Grupo) when 3+ sets are in the cart."""
+    subtotal = cart_total(channels)
+    sets = [c for c in channels if channel_code(c) != GRUPO_CHANNEL_KEY]
+    discount = 0.0
+    if len(sets) >= CART_DISCOUNT_MIN_SETS:
+        discount = cart_total(sets) * CART_DISCOUNT_RATE
+    return subtotal, discount, subtotal - discount
+
+
 def channels_in_category(channels: list[dict[str, Any]], category: str) -> list[dict[str, Any]]:
     matching = [channel for channel in channels if channel_category(channel) == category]
     matching.sort(key=lambda channel: channel_price(channel) or 0, reverse=True)
     return matching
+
+
+def get_stale_cart_telegram_ids(supabase: Client, older_than_minutes: int = 120) -> list[int]:
+    try:
+        response = supabase.table("cart_items").select("telegram_id, added_at").execute()
+        rows = response.data or []
+    except Exception:
+        logger.warning("Could not fetch cart_items for abandonment check", exc_info=True)
+        return []
+    latest: dict[int, datetime] = {}
+    for row in rows:
+        added_at = parse_iso_datetime(row.get("added_at"))
+        if added_at is None:
+            continue
+        telegram_id = row["telegram_id"]
+        if telegram_id not in latest or added_at > latest[telegram_id]:
+            latest[telegram_id] = added_at
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
+    return [telegram_id for telegram_id, ts in latest.items() if ts < cutoff]
+
+
+def already_reminded_telegram_ids(supabase: Client, telegram_ids: list[int]) -> set[int]:
+    if not telegram_ids:
+        return set()
+    try:
+        response = (
+            supabase.table("cart_reminders")
+            .select("telegram_id")
+            .in_("telegram_id", telegram_ids)
+            .execute()
+        )
+        return {row["telegram_id"] for row in (response.data or [])}
+    except Exception:
+        logger.warning("Could not fetch cart_reminders", exc_info=True)
+        return set()
+
+
+def pending_review_telegram_ids(supabase: Client, telegram_ids: list[int]) -> set[int]:
+    if not telegram_ids:
+        return set()
+    try:
+        response = (
+            supabase.table("telegram_users")
+            .select("telegram_id")
+            .in_("telegram_id", telegram_ids)
+            .eq("payment_status", "pending_review")
+            .execute()
+        )
+        return {row["telegram_id"] for row in (response.data or [])}
+    except Exception:
+        logger.warning("Could not fetch pending review users", exc_info=True)
+        return set()
+
+
+def mark_cart_reminded(supabase: Client, telegram_id: int) -> None:
+    try:
+        (
+            supabase.table("cart_reminders")
+            .upsert({"telegram_id": telegram_id, "reminded_at": now_utc_iso()}, on_conflict="telegram_id")
+            .execute()
+        )
+    except Exception:
+        logger.warning("Could not mark cart reminder telegram_id=%s", telegram_id, exc_info=True)
 
 
 def get_access_channel_by_code(supabase: Client, requested_code: str) -> dict[str, Any] | None:
@@ -2395,6 +2511,39 @@ async def remove_user_from_channel(
     logger.info("Removed telegram_id=%s reason=%s", telegram_id, reason)
 
 
+ACTIVE_MEMBER_STATUSES = {"member", "administrator", "creator", "restricted"}
+
+
+async def sweep_blacklisted_user_from_all_channels(
+    bot: Bot, supabase: Client, settings: Settings, telegram_id: int
+) -> list[str]:
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    removed_from: list[str] = []
+    for channel in channels:
+        chat_id_raw = channel_telegram_chat_id(channel)
+        if not chat_id_raw:
+            continue
+        try:
+            chat_id = parse_stored_chat_id(chat_id_raw)
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
+        except Exception:
+            continue
+        if member.status not in ACTIVE_MEMBER_STATUSES:
+            continue
+        try:
+            await bot.ban_chat_member(chat_id=chat_id, user_id=telegram_id)
+            await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+            removed_from.append(channel_label(channel))
+        except Exception:
+            logger.warning(
+                "Could not remove blacklisted telegram_id=%s from channel=%s",
+                telegram_id,
+                channel_code(channel),
+                exc_info=True,
+            )
+    return removed_from
+
+
 def mark_user_inactive(supabase: Client, telegram_id: int, notes: str = "Marked inactive from dashboard") -> None:
     (
         supabase.table("telegram_users")
@@ -2734,7 +2883,13 @@ def cart_summary_text(selected: list[dict[str, Any]]) -> str:
         price_text = f"${price:.0f}" if price is not None else "-"
         lines.append(f"• {channel_label(channel)} — {price_text}")
     lines.append("")
-    lines.append(f"Total: ${cart_total(selected):.0f} MXN")
+    subtotal, discount, total = cart_discount(selected)
+    if discount > 0:
+        lines.append(f"Subtotal: ${subtotal:.0f} MXN")
+        lines.append(f"Descuento por volumen (-{CART_DISCOUNT_RATE * 100:.0f}%): -${discount:.0f} MXN")
+        lines.append(f"Total: ${total:.0f} MXN")
+    else:
+        lines.append(f"Total: ${total:.0f} MXN")
     return "\n".join(lines)
 
 
@@ -3204,7 +3359,8 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         cart_channels_list = cart_channels(
             await asyncio.to_thread(get_access_channels, supabase, settings), cart_keys
         )
-        admin_text += f"💰 Monto esperado: ${cart_total(cart_channels_list):.0f} MXN\n\n"
+        _, _, expected_total = cart_discount(cart_channels_list)
+        admin_text += f"💰 Monto esperado: ${expected_total:.0f} MXN\n\n"
     admin_text += (
         f"telegram_id: {user.id}\n"
         f"username: {username}\n"
@@ -3237,6 +3393,61 @@ async def receive_payment_receipt(message: Message, settings: Settings, supabase
         logger.info("Payment receipt submitted telegram_id=%s cart_size=%s", user.id, len(cart_keys))
     except Exception:
         logger.exception("Could not notify admin about payment receipt telegram_id=%s", user.id)
+
+
+@router.message(Command("sales_stats"))
+async def sales_stats_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    try:
+        rows = await asyncio.to_thread(fetch_all_approved_payment_history, supabase)
+        channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    except Exception as exc:
+        logger.exception("Could not compute sales stats")
+        await message.answer(f"No pude calcular estadísticas: {exc}")
+        return
+
+    price_by_label = {channel_label(c): channel_price(c) or 0 for c in channels}
+    category_by_label = {channel_label(c): channel_category(c) for c in channels}
+
+    channel_counts: dict[str, int] = {}
+    channel_revenue: dict[str, float] = {}
+    category_revenue: dict[str, float] = {"eterea": 0.0, "casera": 0.0, "grupo": 0.0}
+    total_revenue = 0.0
+
+    for row in rows:
+        for label in parse_channel_labels_from_invite_text(row.get("invite_link") or ""):
+            price = price_by_label.get(label, 0)
+            channel_counts[label] = channel_counts.get(label, 0) + 1
+            channel_revenue[label] = channel_revenue.get(label, 0) + price
+            total_revenue += price
+            category = category_by_label.get(label)
+            if category:
+                category_revenue[category] = category_revenue.get(category, 0) + price
+            elif label == GRUPO_CHANNEL_LABEL:
+                category_revenue["grupo"] = category_revenue.get("grupo", 0) + price
+
+    total_transactions = len(rows)
+    avg_order = total_revenue / total_transactions if total_transactions else 0
+    top_sets = sorted(channel_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    lines = [
+        "📊 Estadísticas de ventas (estimado con precios actuales)",
+        f"Transacciones aprobadas: {total_transactions}",
+        f"Ingreso total estimado: ${total_revenue:.0f} MXN",
+        f"Ticket promedio: ${avg_order:.0f} MXN",
+        "",
+        f"Grupo: ${category_revenue.get('grupo', 0):.0f} · Etérea: ${category_revenue.get('eterea', 0):.0f} · Casera: ${category_revenue.get('casera', 0):.0f}",
+        "",
+        "Top 5 sets más vendidos:",
+    ]
+    if top_sets:
+        lines.extend(f"• {label}: {count} veces (${channel_revenue.get(label, 0):.0f} MXN)" for label, count in top_sets)
+    else:
+        lines.append("Sin datos todavía.")
+
+    await send_long_message(message, "\n".join(lines))
 
 
 @router.message(Command("users"))
@@ -3477,7 +3688,17 @@ async def blacklist_user(message: Message, settings: Settings, supabase: Client)
         logger.exception("Could not blacklist telegram_id=%s", telegram_id)
         await message.answer(f"No pude bloquear usuario: {exc}")
         return
-    await message.answer(f"Usuario {telegram_id} agregado a blacklist.")
+    await message.answer(f"Usuario {telegram_id} agregado a blacklist. Revisando canales...")
+    try:
+        removed_from = await sweep_blacklisted_user_from_all_channels(message.bot, supabase, settings, telegram_id)
+    except Exception:
+        logger.exception("Could not sweep blacklisted telegram_id=%s across channels", telegram_id)
+        await message.answer("No pude revisar los canales automáticamente; revísalo a mano si sigue teniendo acceso.")
+        return
+    if removed_from:
+        await message.answer(f"Expulsado de: {', '.join(removed_from)}")
+    else:
+        await message.answer("No estaba activo en ningún canal.")
 
 
 @router.message(Command("unblacklist"))
@@ -4898,9 +5119,13 @@ async def cart_checkout(callback_query: CallbackQuery, settings: Settings, supab
             reply_markup=build_category_picker_keyboard(),
         )
         return
-    total = cart_total(selected)
+    subtotal, discount, total = cart_discount(selected)
+    discount_line = (
+        f"Descuento por volumen aplicado: -${discount:.0f} MXN 🎉\n\n" if discount > 0 else ""
+    )
     await callback_query.message.edit_text(
         f"Total a pagar: ${total:.0f} MXN\n\n"
+        f"{discount_line}"
         f"{CART_PAYMENT_INFO}\n\n"
         "Manda tu comprobante de pago aquí mismo (foto o PDF) y en cuanto lo validemos te llegan tus links 🔓"
     )
@@ -5079,6 +5304,43 @@ async def run_daily_notice_if_needed(bot: Bot, supabase: Client, settings: Setti
     await asyncio.to_thread(set_bot_state, supabase, DAILY_NOTICE_STATE_KEY, today)
 
 
+async def send_cart_abandonment_reminders(bot: Bot, supabase: Client, settings: Settings) -> None:
+    try:
+        stale_ids = await asyncio.to_thread(get_stale_cart_telegram_ids, supabase, 120)
+        if not stale_ids:
+            return
+        already = await asyncio.to_thread(already_reminded_telegram_ids, supabase, stale_ids)
+        pending = await asyncio.to_thread(pending_review_telegram_ids, supabase, stale_ids)
+        candidates = [tid for tid in stale_ids if tid not in already and tid not in pending]
+        if not candidates:
+            return
+        channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        sent = 0
+        for telegram_id in candidates:
+            cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
+            selected = cart_channels(channels, cart_keys)
+            if not selected:
+                await asyncio.to_thread(mark_cart_reminded, supabase, telegram_id)
+                continue
+            text = (
+                "Hola bebé 💕 vi que dejaste algo en tu carrito...\n\n"
+                + cart_summary_text(selected)
+                + "\n\n¿Seguimos? Dale a Confirmar y pagar cuando quieras 🔓"
+            )
+            try:
+                await bot.send_message(telegram_id, text, reply_markup=build_cart_summary_keyboard(selected))
+                sent += 1
+            except (TelegramBadRequest, TelegramForbiddenError):
+                logger.warning("Could not DM cart reminder telegram_id=%s", telegram_id, exc_info=True)
+            except Exception:
+                logger.exception("Unexpected cart reminder failure telegram_id=%s", telegram_id)
+            await asyncio.to_thread(mark_cart_reminded, supabase, telegram_id)
+        if sent:
+            logger.info("Sent %s cart abandonment reminders", sent)
+    except Exception:
+        logger.exception("Cart abandonment reminder job failed")
+
+
 async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) -> None:
     today = datetime.now(APP_TIMEZONE).date()
     try:
@@ -5167,6 +5429,14 @@ async def run_telegram_bot(bot: Bot, supabase: Client, settings: Settings) -> No
         CronTrigger(hour=9, minute=0, timezone=APP_TIMEZONE),
         args=[bot, supabase, settings],
         id="daily_expiry_notification",
+        replace_existing=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        send_cart_abandonment_reminders,
+        IntervalTrigger(minutes=30),
+        args=[bot, supabase, settings],
+        id="cart_abandonment_reminders",
         replace_existing=True,
         max_instances=1,
     )
@@ -5454,13 +5724,14 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         try:
+            cart_keys = await asyncio.to_thread(get_cart_channel_keys, supabase, telegram_id)
             result = await approve_payment(
                 bot,
                 supabase,
                 settings,
                 telegram_id,
                 next(iter(settings.admin_user_ids)),
-                {GRUPO_CHANNEL_KEY},
+                {GRUPO_CHANNEL_KEY} | cart_keys,
             )
             if result.get("duplicate"):
                 return dashboard_redirect(filter, search, page, message=f"Payment was already approved recently; existing link resent for {telegram_id}.")
