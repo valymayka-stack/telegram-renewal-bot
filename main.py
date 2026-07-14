@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -3373,10 +3374,10 @@ async def send_raffle_winner_link(message: Message, settings: Settings, supabase
 @router.message(F.chat.type == "private", F.text)
 async def raffle_trigger_text(message: Message, settings: Settings, supabase: Client) -> None:
     if not message.from_user or (message.text or "").startswith("/"):
-        return
+        raise SkipHandler()
     raffle = await asyncio.to_thread(get_active_raffle_by_trigger, supabase, message.text or "")
     if not raffle:
-        return
+        raise SkipHandler()
     await message.answer(
         "¿Cuántos boletos deseas?",
         reply_markup=raffle_quantity_keyboard(int(raffle["id"]), int(raffle.get("max_tickets_per_user") or 5)),
