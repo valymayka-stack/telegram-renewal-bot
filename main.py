@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
@@ -321,6 +321,10 @@ create index if not exists cart_items_telegram_id_idx on public.cart_items (tele
 alter table public.access_channels add column if not exists photo_file_id text;
 alter table public.access_channels add column if not exists description text;
 alter table public.access_channels add column if not exists featured boolean default false;
+alter table public.raffle_events add column if not exists second_place_ticket text;
+alter table public.raffle_events add column if not exists second_place_telegram_id bigint;
+alter table public.raffle_events add column if not exists third_place_ticket text;
+alter table public.raffle_events add column if not exists third_place_telegram_id bigint;
 create table if not exists public.cart_reminders (
   telegram_id bigint primary key,
   reminded_at timestamptz default now()
@@ -1734,6 +1738,52 @@ def draw_raffle_winner(supabase: Client, raffle: dict[str, Any]) -> dict[str, An
     return {"already_drawn": False, "ticket_number": winner["ticket_number"], "telegram_id": winner["telegram_id"]}
 
 
+def draw_raffle_winners_top3(supabase: Client, raffle: dict[str, Any]) -> dict[str, Any]:
+    if raffle.get("winner_ticket"):
+        return {
+            "already_drawn": True,
+            "places": [
+                {"rank": 1, "ticket_number": raffle.get("winner_ticket"), "telegram_id": raffle.get("winner_telegram_id")},
+                {"rank": 2, "ticket_number": raffle.get("second_place_ticket"), "telegram_id": raffle.get("second_place_telegram_id")},
+                {"rank": 3, "ticket_number": raffle.get("third_place_ticket"), "telegram_id": raffle.get("third_place_telegram_id")},
+            ],
+        }
+    tickets = confirmed_raffle_tickets(supabase, int(raffle["id"]))
+    if not tickets:
+        raise ValueError("No confirmed tickets.")
+    count = min(3, len(tickets))
+    pool = list(tickets)
+    winners: list[dict[str, Any]] = []
+    for _ in range(count):
+        winners.append(pool.pop(secrets.randbelow(len(pool))))
+    payload = {
+        "winner_ticket": winners[0]["ticket_number"],
+        "winner_telegram_id": winners[0]["telegram_id"],
+        "winner_drawn_at": now_utc_iso(),
+        "updated_at": now_utc_iso(),
+    }
+    if len(winners) > 1:
+        payload["second_place_ticket"] = winners[1]["ticket_number"]
+        payload["second_place_telegram_id"] = winners[1]["telegram_id"]
+    if len(winners) > 2:
+        payload["third_place_ticket"] = winners[2]["ticket_number"]
+        payload["third_place_telegram_id"] = winners[2]["telegram_id"]
+    (
+        supabase.table("raffle_events")
+        .update(payload)
+        .eq("id", raffle["id"])
+        .is_("winner_drawn_at", "null")
+        .execute()
+    )
+    return {
+        "already_drawn": False,
+        "places": [
+            {"rank": i + 1, "ticket_number": w["ticket_number"], "telegram_id": w["telegram_id"]}
+            for i, w in enumerate(winners)
+        ],
+    }
+
+
 def payment_receipt_file_url(file_id: Any) -> str | None:
     if not file_id:
         return None
@@ -3018,9 +3068,22 @@ def cart_summary_text(selected: list[dict[str, Any]]) -> str:
 
 
 @router.message(Command("start"))
-async def cart_start(message: Message, settings: Settings, supabase: Client) -> None:
+async def cart_start(message: Message, settings: Settings, supabase: Client, command: CommandObject) -> None:
     if not message.from_user:
         return
+    if command.args:
+        raffle = await asyncio.to_thread(get_active_raffle_by_trigger, supabase, command.args.strip())
+        if raffle:
+            title = raffle.get("title") or "Sorteo"
+            description = raffle.get("description") or ""
+            price = int(raffle.get("ticket_price_mxn") or 0)
+            max_tickets = raffle.get("max_tickets_per_user") or 5
+            await message.answer(
+                f"🎟️ {title}\n\n{description}\n\n"
+                f"Boleto: ${price} MXN · Máximo {max_tickets} boletos por persona"
+            )
+            await send_raffle_quantity_prompt(message.bot, message.from_user.id, raffle)
+            return
     existing_user = await asyncio.to_thread(get_registered_user, supabase, message.from_user.id)
     if await can_browse_cart_catalog(supabase, message.from_user.id, existing_user):
         await message.answer(
@@ -3333,6 +3396,30 @@ async def raffle_draw_command(message: Message, settings: Settings, supabase: Cl
         )
     except Exception as exc:
         logger.exception("Could not draw raffle")
+        await message.answer(f"No pude hacer el sorteo: {exc}")
+
+
+@router.message(Command("raffle_draw_top3"))
+async def raffle_draw_top3_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    raffle = await asyncio.to_thread(get_active_raffle, supabase)
+    if not raffle:
+        await message.answer("No hay ninguna rifa activa.")
+        return
+    try:
+        result = await asyncio.to_thread(draw_raffle_winners_top3, supabase, raffle)
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        prefix = "Ya se había sorteado" if result["already_drawn"] else "🎉 Sorteo realizado"
+        lines = [prefix + ":"]
+        for place in result["places"]:
+            if place["ticket_number"] is None:
+                continue
+            lines.append(f"{medals.get(place['rank'], '•')} Lugar {place['rank']}: boleto {place['ticket_number']} — telegram_id {place['telegram_id']}")
+        await send_long_message(message, "\n".join(lines))
+    except Exception as exc:
+        logger.exception("Could not draw top-3 raffle winners")
         await message.answer(f"No pude hacer el sorteo: {exc}")
 
 
