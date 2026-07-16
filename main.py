@@ -2467,6 +2467,44 @@ async def confirm_renewal_payment(
     return {"sent": sent, "expiry": expiry}
 
 
+FEATURED_CROSS_SELL_COUNT = 3
+
+
+async def send_featured_cross_sell(bot: Bot, supabase: Client, settings: Settings, telegram_id: int) -> None:
+    try:
+        channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        candidates = [
+            c
+            for c in channels
+            if channel_is_featured(c)
+            and channel_code(c) != GRUPO_CHANNEL_KEY
+            and channel_code(c) not in HIDDEN_APPROVAL_CHANNEL_CODES
+        ]
+        candidates.sort(
+            key=lambda c: parse_iso_datetime(c.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        picks = candidates[:FEATURED_CROSS_SELL_COUNT]
+        if not picks:
+            return
+        await bot.send_message(telegram_id, "✨ Ya que estás por aquí, te quiero recomendar esto 👀")
+        for channel in picks:
+            caption = carousel_caption(channel)
+            photo = channel_photo_file_id(channel)
+            if photo:
+                await bot.send_photo(telegram_id, photo, caption=caption)
+            else:
+                await bot.send_message(telegram_id, caption)
+        await bot.send_message(
+            telegram_id,
+            "Si te late alguno (o varios en combo), manda tu comprobante aquí mismo y dime cuál(es) quieres 💕",
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.warning("Could not DM featured cross-sell telegram_id=%s", telegram_id, exc_info=True)
+    except Exception:
+        logger.exception("Could not send featured cross-sell telegram_id=%s", telegram_id)
+
+
 async def approve_payment(
     bot: Bot,
     supabase: Client,
@@ -2609,6 +2647,8 @@ async def approve_payment(
             settings.admin_chat_id,
             "No pude enviar el link. El usuario debe abrir el bot o escribirle primero.",
         )
+    if includes_grupo and dm_sent:
+        await send_featured_cross_sell(bot, supabase, settings, telegram_id)
     logger.info("Payment approved telegram_id=%s admin_id=%s dm_sent=%s", telegram_id, admin_id, dm_sent)
     return {"invite_link": invite_link, "channel_links": channel_links, "duplicate": False, "reused": reused_invite}
 
