@@ -2254,7 +2254,7 @@ def payment_recently_approved(row: dict[str, Any] | None) -> bool:
     approved_at = parse_iso_datetime(row.get("approved_at"))
     if not approved_at:
         return False
-    return datetime.now(timezone.utc) - approved_at < timedelta(hours=1)
+    return datetime.now(timezone.utc) - approved_at < timedelta(minutes=3)
 
 
 async def save_invite_link(
