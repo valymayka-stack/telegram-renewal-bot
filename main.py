@@ -5475,6 +5475,10 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             if not selected:
                 await callback_query.answer("Select at least one channel before approving.", show_alert=True)
                 return
+            try:
+                await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+            except Exception:
+                pass
             result = await approve_payment(
                 callback_query.bot,
                 supabase,
