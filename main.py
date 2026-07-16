@@ -1909,6 +1909,11 @@ async def announce_and_deliver_raffle_top3(
         raise ValueError("No hay ninguna rifa activa.")
     result = await asyncio.to_thread(draw_raffle_winners_top3, supabase, raffle)
     places = {p["rank"]: p for p in result["places"] if p.get("ticket_number") is not None}
+    if result["already_drawn"]:
+        return {
+            "already_drawn": True,
+            "delivery_log": ["Ya se había sorteado y entregado antes; no se reenvían premios ni se vuelve a anunciar."],
+        }
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = [f"🎉 GANADORES — {raffle.get('title') or 'Sorteo'} 🎉", ""]
