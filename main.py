@@ -2247,16 +2247,57 @@ async def send_channel_invites_to_user(bot: Bot, telegram_id: int, channel_links
         return False
 
 
-async def send_renewal_confirmation(bot: Bot, telegram_id: int) -> bool:
+async def confirm_renewal_payment(
+    bot: Bot,
+    supabase: Client,
+    telegram_id: int,
+    admin_id: int,
+) -> dict[str, Any]:
+    existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    try:
+        expiry = await asyncio.to_thread(renew_user_from_current_expiry, supabase, telegram_id)
+    except ValueError:
+        expiry = await asyncio.to_thread(renew_user_from_today, supabase, telegram_id)
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {
+            "approved_by_admin_id": admin_id,
+            "approved_at": now_utc_iso(),
+            "pending_payment_file_id": None,
+            "pending_payment_file_type": None,
+        },
+    )
+    await asyncio.to_thread(
+        insert_payment_history,
+        supabase,
+        telegram_id,
+        "approved",
+        "paid",
+        admin_id,
+        existing_user.get("pending_payment_file_id") if existing_user else None,
+        existing_user.get("pending_payment_file_type") if existing_user else None,
+        "Grupo: renovación",
+        None,
+        expiry,
+        True,
+        "Renewal confirmed by admin",
+        existing_user.get("username") if existing_user else None,
+        existing_user.get("first_name") if existing_user else None,
+    )
+    await asyncio.to_thread(remove_cart_item, supabase, telegram_id, GRUPO_CHANNEL_KEY)
+    expiry_display = datetime.fromisoformat(expiry).strftime("%d/%m/%Y")
     try:
         await bot.send_message(
             telegram_id,
-            "Tu membresía ha sido renovada exitosamente. Gracias 💕",
+            f"Tu membresía ha sido renovada exitosamente 💕\n\nTu nueva fecha de vencimiento es: {expiry_display}",
         )
-        return True
+        sent = True
     except (TelegramBadRequest, TelegramForbiddenError):
         logger.warning("Could not DM renewal confirmation telegram_id=%s", telegram_id, exc_info=True)
-        return False
+        sent = False
+    return {"sent": sent, "expiry": expiry}
 
 
 async def approve_payment(
@@ -3952,7 +3993,7 @@ async def payment_history_command(message: Message, settings: Settings, supabase
 
 
 @router.message(Command("confirm_renewal"))
-async def confirm_renewal(message: Message, settings: Settings) -> None:
+async def confirm_renewal(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
         await reject_non_admin(message)
         return
@@ -3960,11 +4001,13 @@ async def confirm_renewal(message: Message, settings: Settings) -> None:
     if telegram_id is None:
         await message.answer("Uso: /confirm_renewal <telegram_id>")
         return
-    sent = await send_renewal_confirmation(message.bot, telegram_id)
-    if sent:
-        await message.answer(f"Confirmación de renovación enviada a {telegram_id}.")
+    result = await confirm_renewal_payment(message.bot, supabase, telegram_id, message.from_user.id)
+    if result["sent"]:
+        await message.answer(f"Renovación confirmada para {telegram_id}. Nuevo vencimiento: {result['expiry']}.")
     else:
-        await message.answer("No pude enviar la confirmación. El usuario debe abrir el bot o escribirle primero.")
+        await message.answer(
+            f"Renovado ({result['expiry']}) pero no pude avisarle por DM. El usuario debe abrir el bot o escribirle primero."
+        )
 
 
 @router.message(Command("contact_admin"))
@@ -5248,22 +5291,40 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
                 PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
             await callback_query.answer("Solicitud enviada 🔁")
         elif action == "confirm_renewal":
-            sent = await send_renewal_confirmation(callback_query.bot, telegram_id)
-            if sent:
+            result = await confirm_renewal_payment(
+                callback_query.bot,
+                supabase,
+                telegram_id,
+                callback_query.from_user.id,
+            )
+            selection_key = payment_selection_key(callback_query, telegram_id)
+            if selection_key:
+                PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
+            if result["sent"]:
+                summary = f"✅ RENOVACIÓN CONFIRMADA — Nuevo vencimiento: {result['expiry']}"
                 await callback_query.bot.send_message(
                     settings.admin_chat_id,
-                    f"Renovación confirmada para {telegram_id} ✅",
+                    f"Renovación confirmada para {telegram_id} ✅ Nuevo vencimiento: {result['expiry']}",
                 )
                 await callback_query.answer("Confirmación enviada ✅")
             else:
+                summary = f"✅ RENOVACIÓN CONFIRMADA (sin DM) — Nuevo vencimiento: {result['expiry']}"
                 await callback_query.bot.send_message(
                     settings.admin_chat_id,
-                    f"No pude confirmar renovación para {telegram_id}. El usuario debe abrir el bot o escribirle primero.",
+                    f"Renovación confirmada para {telegram_id} pero no pude avisarle por DM. Nuevo vencimiento: {result['expiry']}",
                 )
                 await callback_query.answer(
-                    "No pude enviar la confirmación. El usuario debe abrir el bot o escribirle primero.",
+                    "Renovado, pero no pude enviarle el DM. El usuario debe abrir el bot o escribirle primero.",
                     show_alert=True,
                 )
+            try:
+                original_text = callback_query.message.text or ""
+                await callback_query.message.edit_text(
+                    f"{original_text}\n\n{summary}",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+                )
+            except Exception:
+                logger.warning("Could not clean up renewal payment message telegram_id=%s", telegram_id, exc_info=True)
         else:
             await callback_query.answer("Acción inválida.", show_alert=True)
             return
@@ -5976,13 +6037,13 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
-        sent = await send_renewal_confirmation(bot, telegram_id)
-        if sent:
+        result = await confirm_renewal_payment(bot, supabase, telegram_id, next(iter(settings.admin_user_ids)))
+        if result["sent"]:
             return dashboard_redirect(
                 filter,
                 search,
                 page,
-                message=f"Confirmación de renovación enviada a {telegram_id}.",
+                message=f"Renovación confirmada para {telegram_id}. Nuevo vencimiento: {result['expiry']}.",
             )
         return dashboard_redirect(
             filter,
