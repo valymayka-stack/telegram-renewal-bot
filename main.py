@@ -90,6 +90,14 @@ PREDICTION_MEX_INGLATERRA_TEXT = (
 )
 RAFFLE_BUTTON_TEXT = "🎟️ QUIERO MIS BOLETOS"
 RAFFLE_PRIZE_CHANNEL_CODE = "premio_sorteo"
+RAFFLE_TOP3_SET_PRIZE_CHANNEL_CODE = "hot_tub"
+RAFFLE_TOP3_GRUPO_RANKS = {1, 2}
+RAFFLE_TOP3_SET_RANKS = {1, 3}
+RAFFLE_TOP3_PRIZE_LABELS = {
+    1: "1 mes de Grupo Exclusivo + set Hot Tub",
+    2: "1 mes de Grupo Exclusivo",
+    3: "set Hot Tub",
+}
 GRUPO_CHANNEL_KEY = "grupo"
 GRUPO_CHANNEL_LABEL = "Grupo"
 LADY_CHANNEL_KEY = "lady_in_red"
@@ -1784,6 +1792,160 @@ def draw_raffle_winners_top3(supabase: Client, raffle: dict[str, Any]) -> dict[s
     }
 
 
+def user_has_active_membership(user: dict[str, Any] | None) -> bool:
+    if not user or user.get("status") != "active":
+        return False
+    expiry = parse_iso_date(user.get("expiry_date"))
+    return bool(expiry and expiry >= datetime.now(APP_TIMEZONE).date())
+
+
+async def deliver_raffle_grupo_prize(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+    admin_id: int,
+) -> str:
+    existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
+    if user_has_active_membership(existing_user):
+        try:
+            expiry = await asyncio.to_thread(renew_user_from_current_expiry, supabase, telegram_id)
+        except ValueError:
+            expiry = await asyncio.to_thread(renew_user_from_today, supabase, telegram_id)
+        expiry_display = datetime.fromisoformat(expiry).strftime("%d/%m/%Y")
+        await bot.send_message(
+            telegram_id,
+            "🎉 ¡Felicidades, ganaste el sorteo! 🎁\n\n"
+            "Como ya tienes el Grupo activo, tu suscripción se renovó 30 días más.\n\n"
+            f"Tu nueva fecha de vencimiento es: {expiry_display}",
+        )
+        return f"Grupo renovado (ya era miembro) — nuevo vencimiento {expiry}"
+
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    prize_keys = {GRUPO_CHANNEL_KEY} | GRUPO_BUNDLED_CHANNEL_KEYS
+    prize_channels = [c for c in channels if channel_code(c) in prize_keys]
+    grupo_channel = next((c for c in prize_channels if channel_code(c) == GRUPO_CHANNEL_KEY), None)
+    if not grupo_channel:
+        raise ValueError("Canal Grupo no está configurado en access_channels.")
+    today = datetime.now(APP_TIMEZONE).date()
+    expiry_date = today + timedelta(days=30)
+    channel_links: list[dict[str, str]] = []
+    main_invite_link = ""
+    main_invite_name = ""
+    for channel in prize_channels:
+        code = channel_code(channel)
+        chat_id = parse_stored_chat_id(channel_telegram_chat_id(channel))
+        invite_link, invite_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, code)
+        await asyncio.to_thread(
+            save_user_channel_access,
+            supabase,
+            telegram_id,
+            channel,
+            invite_link,
+            invite_name,
+            expiry_date.isoformat() if channel_has_expiry(channel) else None,
+        )
+        channel_links.append({"label": channel_label(channel), "invite_link": invite_link})
+        if code == GRUPO_CHANNEL_KEY:
+            main_invite_link = invite_link
+            main_invite_name = invite_name
+    await asyncio.to_thread(
+        upsert_user_payload,
+        supabase,
+        telegram_id,
+        {
+            "telegram_id": telegram_id,
+            "status": "active",
+            "payment_status": "paid",
+            "invite_link": main_invite_link,
+            "invite_link_name": main_invite_name,
+            "invite_link_revoked": False,
+            "invite_link_used": False,
+            "invite_link_created_at": now_utc_iso(),
+            "membership_start_date": today.isoformat(),
+            "expiry_date": expiry_date.isoformat(),
+            "approved_by_admin_id": admin_id,
+            "approved_at": now_utc_iso(),
+            "last_payment_at": now_utc_iso(),
+            "notes": "Raffle prize: Grupo",
+        },
+    )
+    lines = ["🎉 ¡Felicidades, ganaste el sorteo! 🎁", "", "Aquí está tu acceso:"]
+    for item in channel_links:
+        lines.append(f"{item['label']}: {item['invite_link']}")
+    await bot.send_message(telegram_id, "\n".join(lines))
+    return f"Grupo nuevo (+{len(channel_links) - 1} canales incluidos) — vence {expiry_date.isoformat()}"
+
+
+async def deliver_raffle_set_prize(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+    prize_channel_code: str,
+) -> str:
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    channel = next((c for c in channels if channel_code(c) == prize_channel_code), None)
+    if not channel:
+        raise ValueError(f"Canal premio no encontrado: {prize_channel_code}")
+    chat_id = parse_stored_chat_id(channel_telegram_chat_id(channel))
+    invite_link, invite_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, prize_channel_code)
+    await asyncio.to_thread(save_user_channel_access, supabase, telegram_id, channel, invite_link, invite_name, None)
+    await bot.send_message(
+        telegram_id,
+        f"🎁 ¡Felicidades, ganaste el sorteo! Aquí está tu acceso al set {channel_label(channel)}:\n{invite_link}",
+    )
+    return f"Set {channel_label(channel)} entregado"
+
+
+async def announce_and_deliver_raffle_top3(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    admin_id: int,
+) -> dict[str, Any]:
+    raffle = await asyncio.to_thread(get_active_raffle, supabase)
+    if not raffle:
+        raise ValueError("No hay ninguna rifa activa.")
+    result = await asyncio.to_thread(draw_raffle_winners_top3, supabase, raffle)
+    places = {p["rank"]: p for p in result["places"] if p.get("ticket_number") is not None}
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [f"🎉 GANADORES — {raffle.get('title') or 'Sorteo'} 🎉", ""]
+    for rank in (1, 2, 3):
+        place = places.get(rank)
+        if not place:
+            continue
+        lines.append(f"{medals.get(rank, '•')} Boleto {place['ticket_number']} — {RAFFLE_TOP3_PRIZE_LABELS.get(rank, '')}")
+    lines.append("")
+    lines.append("📩 Los premios se enviarán por privado a cada ganador. ¡Felicidades! 🎊")
+    await bot.send_message(settings.content_channel_id, "\n".join(lines))
+
+    delivery_log: list[str] = []
+    for rank in (1, 2, 3):
+        place = places.get(rank)
+        if not place or not place.get("telegram_id"):
+            continue
+        telegram_id = int(place["telegram_id"])
+        try:
+            if rank in RAFFLE_TOP3_GRUPO_RANKS:
+                status = await deliver_raffle_grupo_prize(bot, supabase, settings, telegram_id, admin_id)
+                delivery_log.append(f"Lugar {rank} ({telegram_id}): {status}")
+            if rank in RAFFLE_TOP3_SET_RANKS:
+                status = await deliver_raffle_set_prize(
+                    bot, supabase, settings, telegram_id, RAFFLE_TOP3_SET_PRIZE_CHANNEL_CODE
+                )
+                delivery_log.append(f"Lugar {rank} ({telegram_id}): {status}")
+        except (TelegramBadRequest, TelegramForbiddenError):
+            logger.warning("Could not DM raffle prize rank=%s telegram_id=%s", rank, telegram_id, exc_info=True)
+            delivery_log.append(f"Lugar {rank} ({telegram_id}): no pude enviar DM (bot bloqueado o nunca abrió el bot)")
+        except Exception as exc:
+            logger.exception("Could not deliver raffle prize rank=%s telegram_id=%s", rank, telegram_id)
+            delivery_log.append(f"Lugar {rank} ({telegram_id}): ERROR - {exc}")
+
+    return {"already_drawn": result["already_drawn"], "delivery_log": delivery_log}
+
+
 def payment_receipt_file_url(file_id: Any) -> str | None:
     if not file_id:
         return None
@@ -3462,6 +3624,22 @@ async def raffle_draw_top3_command(message: Message, settings: Settings, supabas
     except Exception as exc:
         logger.exception("Could not draw top-3 raffle winners")
         await message.answer(f"No pude hacer el sorteo: {exc}")
+
+
+@router.message(Command("raffle_announce_winners"))
+async def raffle_announce_winners_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    try:
+        result = await announce_and_deliver_raffle_top3(message.bot, supabase, settings, message.from_user.id)
+        prefix = "Ya se había sorteado y entregado" if result["already_drawn"] else "🎉 Sorteo anunciado y premios entregados"
+        lines = [prefix + ":"]
+        lines.extend(result["delivery_log"] or ["(sin ganadores con boletos confirmados)"])
+        await send_long_message(message, "\n".join(lines))
+    except Exception as exc:
+        logger.exception("Could not announce/deliver top-3 raffle winners")
+        await message.answer(f"No pude anunciar/entregar el sorteo: {exc}")
 
 
 @router.message(Command("send_raffle_winner_link"))
