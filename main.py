@@ -90,13 +90,13 @@ PREDICTION_MEX_INGLATERRA_TEXT = (
 )
 RAFFLE_BUTTON_TEXT = "🎟️ QUIERO MIS BOLETOS"
 RAFFLE_PRIZE_CHANNEL_CODE = "premio_sorteo"
-RAFFLE_TOP3_SET_PRIZE_CHANNEL_CODE = "hot_tub"
-RAFFLE_TOP3_GRUPO_RANKS = {1, 2}
-RAFFLE_TOP3_SET_RANKS = {1, 3}
+RAFFLE_TOP3_SET_PRIZE_CHANNEL_CODE = "love_seat"
+RAFFLE_TOP3_GRUPO_RANKS = {1, 3}
+RAFFLE_TOP3_SET_RANKS = {1, 2}
 RAFFLE_TOP3_PRIZE_LABELS = {
-    1: "1 mes de Grupo Exclusivo + set Hot Tub",
-    2: "1 mes de Grupo Exclusivo",
-    3: "set Hot Tub",
+    1: "1 mes de Grupo Exclusivo + set Love Seat",
+    2: "set Love Seat",
+    3: "1 mes de Grupo Exclusivo",
 }
 GRUPO_CHANNEL_KEY = "grupo"
 GRUPO_CHANNEL_LABEL = "Grupo"
