@@ -348,6 +348,13 @@ create table if not exists public.master_content (
   created_at timestamptz default now()
 );
 create index if not exists master_content_channel_code_idx on public.master_content (channel_code);
+create table if not exists public.watermark_deliveries (
+  id bigserial primary key,
+  telegram_id bigint not null,
+  message_id bigint not null,
+  delivered_at timestamptz default now()
+);
+create index if not exists watermark_deliveries_telegram_id_idx on public.watermark_deliveries (telegram_id);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -922,10 +929,29 @@ async def deliver_watermarked_content(
         input_file = BufferedInputFile(watermarked_bytes, filename=f"{channel_code(channel)}_{index}.jpg")
         caption = channel_label(channel) if index == 0 else None
         media.append(InputMediaPhoto(media=input_file, caption=caption))
+    sent_message_ids: list[int] = []
     for batch_start in range(0, len(media), 10):
         batch = media[batch_start : batch_start + 10]
-        await bot.send_media_group(telegram_id, batch, protect_content=True)
+        sent_messages = await bot.send_media_group(telegram_id, batch, protect_content=True)
+        sent_message_ids.extend(message.message_id for message in sent_messages)
+    if sent_message_ids:
+        await asyncio.to_thread(record_watermark_delivery, supabase, telegram_id, sent_message_ids)
     return True
+
+
+def record_watermark_delivery(supabase: Client, telegram_id: int, message_ids: list[int]) -> None:
+    rows = [{"telegram_id": telegram_id, "message_id": message_id} for message_id in message_ids]
+    supabase.table("watermark_deliveries").insert(rows).execute()
+
+
+def get_watermark_delivery_message_ids(supabase: Client, telegram_id: int) -> list[int]:
+    response = (
+        supabase.table("watermark_deliveries")
+        .select("message_id")
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+    return [row["message_id"] for row in (response.data or [])]
 
 
 CHANNEL_NEW_BADGE_DAYS = 7
@@ -4017,6 +4043,40 @@ async def feature_set_command(message: Message, settings: Settings, supabase: Cl
         await message.answer(f"⭐ {label} ahora está destacado.")
     else:
         await message.answer(f"{label} ya no está destacado.")
+
+
+@router.message(F.chat.type == "private", F.photo, F.forward_origin)
+async def forwarded_photo_alert(message: Message, settings: Settings, supabase: Client) -> None:
+    if not message.from_user:
+        return
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "-"
+    try:
+        await message.bot.delete_message(chat_id=user.id, message_id=message.message_id)
+    except Exception:
+        logger.warning("Could not delete forwarded photo from telegram_id=%s", user.id, exc_info=True)
+
+    deleted_watermarked = 0
+    try:
+        message_ids = await asyncio.to_thread(get_watermark_delivery_message_ids, supabase, user.id)
+        for message_id in message_ids:
+            try:
+                await message.bot.delete_message(chat_id=user.id, message_id=message_id)
+                deleted_watermarked += 1
+            except Exception:
+                logger.warning(
+                    "Could not delete watermarked message_id=%s for telegram_id=%s", message_id, user.id, exc_info=True
+                )
+    except Exception:
+        logger.exception("Could not look up watermark deliveries for telegram_id=%s", user.id)
+
+    await message.bot.send_message(
+        settings.admin_chat_id,
+        "🚨 POSIBLE INTENTO DE FILTRACIÓN 🚨\n\n"
+        f"{user.first_name or '-'} {username} (telegram_id: {user.id}) reenvió una foto al bot.\n\n"
+        f"Se borró el mensaje reenviado y {deleted_watermarked} foto(s) con marca de agua que se le habían entregado antes.\n\n"
+        "Revísalo — puede que quieras blacklistearlo manualmente.",
+    )
 
 
 @router.message(F.chat.type == "private", (F.photo | F.document))
