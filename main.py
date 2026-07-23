@@ -17,7 +17,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, ChatMemberUpdated, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
 from supabase import Client, create_client
+from PIL import Image, ImageDraw, ImageFont
 import uvicorn
 
 
@@ -337,6 +338,16 @@ create table if not exists public.cart_reminders (
   telegram_id bigint primary key,
   reminded_at timestamptz default now()
 );
+alter table public.access_channels add column if not exists watermark_delivery boolean default false;
+create table if not exists public.master_content (
+  id bigserial primary key,
+  channel_code text not null,
+  file_id text not null,
+  file_type text not null default 'photo',
+  sort_order integer default 0,
+  created_at timestamptz default now()
+);
+create index if not exists master_content_channel_code_idx on public.master_content (channel_code);
 """.strip()
 
 logger = logging.getLogger(__name__)
@@ -357,6 +368,7 @@ class Settings:
     admin_password: str
     auto_remove_expired: bool
     renewal_notice_days: tuple[int, ...]
+    master_channel_id: int | str | None
 
 
 def configure_logging() -> None:
@@ -432,6 +444,7 @@ def load_settings() -> Settings:
         admin_password=required_env("ADMIN_PASSWORD"),
         auto_remove_expired=parse_bool(os.getenv("AUTO_REMOVE_EXPIRED"), default=False),
         renewal_notice_days=parse_notice_days(os.getenv("RENEWAL_NOTICE_DAYS")),
+        master_channel_id=parse_chat_id(os.environ["MASTER_CHANNEL_ID"]) if os.getenv("MASTER_CHANNEL_ID") else None,
     )
 
 
@@ -818,6 +831,101 @@ def channel_photo_file_id(channel: dict[str, Any]) -> str | None:
 
 def channel_description(channel: dict[str, Any]) -> str | None:
     return channel.get("description") or None
+
+
+def channel_watermark_delivery(channel: dict[str, Any]) -> bool:
+    return channel.get("watermark_delivery") is True
+
+
+def get_master_content(supabase: Client, channel_code: str) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("master_content")
+        .select("*")
+        .eq("channel_code", channel_code)
+        .order("sort_order")
+        .order("id")
+        .execute()
+    )
+    return response.data or []
+
+
+def insert_master_content(supabase: Client, channel_code: str, file_id: str, file_type: str, sort_order: int) -> None:
+    (
+        supabase.table("master_content")
+        .insert(
+            {
+                "channel_code": channel_code,
+                "file_id": file_id,
+                "file_type": file_type,
+                "sort_order": sort_order,
+            }
+        )
+        .execute()
+    )
+
+
+def get_max_master_content_sort_order(supabase: Client, channel_code: str) -> int:
+    response = (
+        supabase.table("master_content")
+        .select("sort_order")
+        .eq("channel_code", channel_code)
+        .order("sort_order", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return int(rows[0]["sort_order"]) if rows else 0
+
+
+def apply_watermark(image_bytes: bytes, label: str) -> bytes:
+    image = Image.open(BytesIO(image_bytes)).convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(18, image.width // 22))
+    except Exception:
+        font = ImageFont.load_default()
+    text = f"  {label}  "
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    step_x = text_w + 40
+    step_y = text_h + 60
+    for y in range(-step_y, image.height + step_y, step_y):
+        offset = (y // step_y) % 2
+        for x in range(-step_x + offset * (step_x // 2), image.width + step_x, step_x):
+            draw.text((x, y), text, font=font, fill=(255, 255, 255, 90))
+    rotated = overlay.rotate(30, expand=False)
+    watermarked = Image.alpha_composite(image, rotated).convert("RGB")
+    buffer = BytesIO()
+    watermarked.save(buffer, format="JPEG", quality=92)
+    return buffer.getvalue()
+
+
+async def deliver_watermarked_content(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    telegram_id: int,
+    username: str | None,
+    channel: dict[str, Any],
+) -> bool:
+    items = await asyncio.to_thread(get_master_content, supabase, channel_code(channel))
+    if not items:
+        return False
+    label = f"@{username}" if username else f"TG-{telegram_id}"
+    media: list[InputMediaPhoto] = []
+    for index, item in enumerate(items):
+        file = await bot.get_file(item["file_id"])
+        buffer = BytesIO()
+        await bot.download_file(file.file_path, destination=buffer)
+        watermarked_bytes = await asyncio.to_thread(apply_watermark, buffer.getvalue(), label)
+        input_file = BufferedInputFile(watermarked_bytes, filename=f"{channel_code(channel)}_{index}.jpg")
+        caption = channel_label(channel) if index == 0 else None
+        media.append(InputMediaPhoto(media=input_file, caption=caption))
+    for batch_start in range(0, len(media), 10):
+        batch = media[batch_start : batch_start + 10]
+        await bot.send_media_group(telegram_id, batch, protect_content=True)
+    return True
 
 
 CHANNEL_NEW_BADGE_DAYS = 7
@@ -2567,6 +2675,17 @@ async def approve_payment(
                 expiry.isoformat() if channel_has_expiry(channel) else None,
             )
             continue
+        if channel_watermark_delivery(channel):
+            delivered = await deliver_watermarked_content(
+                bot, supabase, settings, telegram_id, existing_user.get("username") if existing_user else None, channel
+            )
+            channel_links.append(
+                {
+                    "label": channel_label(channel),
+                    "invite_link": "Enviado por DM con marca de agua 🔒" if delivered else "ERROR: sin fotos maestras cargadas",
+                }
+            )
+            continue
         telegram_chat_id = channel_telegram_chat_id(channel)
         if not telegram_chat_id:
             logger.error("Selected approval channel is missing telegram_chat_id: %s", channel)
@@ -3817,6 +3936,59 @@ async def add_set_command(message: Message, settings: Settings, supabase: Client
         f"destacado: {'sí' if destacado else 'no'}\n\n"
         "Recuerda: @renaaaa_bot debe ser administrador de ese canal con permiso de invitar."
     )
+
+
+@router.channel_post(F.photo, F.caption.startswith("/master"))
+async def master_content_capture(message: Message, settings: Settings, supabase: Client) -> None:
+    if not settings.master_channel_id or message.chat.id != settings.master_channel_id:
+        return
+    parts = (message.caption or "").split()
+    if len(parts) != 2:
+        await message.answer("Uso: pon una foto con caption \"/master <codigo_del_set>\", ej: /master hot_tub")
+        return
+    code = parts[1].strip().lower()
+    file_id = message.photo[-1].file_id
+    try:
+        next_order = await asyncio.to_thread(get_max_master_content_sort_order, supabase, code)
+        await asyncio.to_thread(insert_master_content, supabase, code, file_id, "photo", next_order + 1)
+    except Exception as exc:
+        logger.exception("Could not save master content code=%s", code)
+        await message.answer(f"No pude guardar la foto maestra: {exc}")
+        return
+    total = len(await asyncio.to_thread(get_master_content, supabase, code))
+    await message.answer(f"✅ Foto guardada para '{code}' (van {total} en total)")
+
+
+@router.message(Command("toggle_watermark"))
+async def toggle_watermark_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Uso: /toggle_watermark <codigo>\nActiva o desactiva la entrega por DM con marca de agua para ese set.")
+        return
+    code = parts[1].strip().lower()
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, code)
+    if not channel:
+        await message.answer(f"No encontré un canal activo con el código '{code}'.")
+        return
+    new_state = not channel_watermark_delivery(channel)
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("access_channels").update({"watermark_delivery": new_state}).eq("code", code).execute()
+        )
+    except Exception as exc:
+        logger.exception("Could not toggle watermark_delivery code=%s", code)
+        await message.answer(f"No pude actualizar: {exc}")
+        return
+    if new_state:
+        master_count = len(await asyncio.to_thread(get_master_content, supabase, code))
+        await message.answer(
+            f"✅ '{code}' ahora se entrega por DM con marca de agua (tiene {master_count} foto(s) maestra(s) cargada(s))."
+        )
+    else:
+        await message.answer(f"✅ '{code}' ahora se entrega normal, por link de canal.")
 
 
 @router.message(Command("feature_set"))

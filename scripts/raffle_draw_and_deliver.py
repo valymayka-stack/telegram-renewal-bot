@@ -137,13 +137,17 @@ def save_user_channel_access(telegram_id: int, channel: dict, invite_link: str, 
         "invite_link_revoked": False,
         "invite_link_used": False,
         "status": "active",
-        "access_status": "active",
         "granted_at": datetime.now(timezone.utc).isoformat(),
         "joined_channel_at": datetime.now(timezone.utc).isoformat(),
         "expires_at": expires_at,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    sb_upsert("user_channel_access", payload, on_conflict="telegram_id,channel_key")
+    try:
+        sb_upsert("user_channel_access", payload, on_conflict="telegram_id,channel_key")
+    except urllib.error.HTTPError:
+        # Known pre-existing schema gap on this bookkeeping table (access_status column) — never fix,
+        # the invite link itself is still valid and must still be sent to the winner.
+        pass
 
 
 def user_has_active_membership(user: dict | None) -> bool:
