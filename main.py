@@ -882,18 +882,18 @@ def apply_watermark(image_bytes: bytes, label: str) -> bytes:
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(18, image.width // 22))
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(34, image.width // 11))
     except Exception:
         font = ImageFont.load_default()
     text = f"  {label}  "
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    step_x = text_w + 40
-    step_y = text_h + 60
+    step_x = text_w + 30
+    step_y = text_h + 50
     for y in range(-step_y, image.height + step_y, step_y):
         offset = (y // step_y) % 2
         for x in range(-step_x + offset * (step_x // 2), image.width + step_x, step_x):
-            draw.text((x, y), text, font=font, fill=(255, 255, 255, 90))
+            draw.text((x, y), text, font=font, fill=(255, 255, 255, 130))
     rotated = overlay.rotate(30, expand=False)
     watermarked = Image.alpha_composite(image, rotated).convert("RGB")
     buffer = BytesIO()
@@ -912,7 +912,7 @@ async def deliver_watermarked_content(
     items = await asyncio.to_thread(get_master_content, supabase, channel_code(channel))
     if not items:
         return False
-    label = f"@{username}" if username else f"TG-{telegram_id}"
+    label = f"ID {telegram_id}"
     media: list[InputMediaPhoto] = []
     for index, item in enumerate(items):
         file = await bot.get_file(item["file_id"])
