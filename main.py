@@ -4483,7 +4483,7 @@ async def contact_admin(message: Message, settings: Settings) -> None:
             telegram_id,
             "Hola 👋\n\n"
             "No puedo validar tu pago por el momento.\n\n"
-            "Por favor contacta a @chivi01 para continuar con tu solicitud.\n\n"
+            "Por favor contacta a @chivismontalvoo para continuar con tu solicitud.\n\n"
             "Gracias 💕",
         )
     except (TelegramBadRequest, TelegramForbiddenError):
