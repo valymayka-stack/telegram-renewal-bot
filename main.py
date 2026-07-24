@@ -4047,6 +4047,10 @@ async def feature_set_command(message: Message, settings: Settings, supabase: Cl
 
 @router.message(F.chat.type == "private", F.photo, F.forward_origin)
 async def forwarded_photo_alert(message: Message, settings: Settings, supabase: Client) -> None:
+    # Desactivado: no se está usando la entrega por DM con marca de agua por ahora, así que esto
+    # no debe interceptar fotos reenviadas legítimas (ej. comprobantes de pago). Para reactivar,
+    # quita este return.
+    return
     if not message.from_user:
         return
     user = message.from_user
