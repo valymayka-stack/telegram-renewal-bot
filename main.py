@@ -2341,7 +2341,6 @@ async def create_one_use_invite_link(bot: Bot, settings: Settings, telegram_id: 
         chat_id=settings.content_channel_id,
         name=name,
         member_limit=1,
-        expire_date=datetime.now(timezone.utc) + INVITE_LINK_LIFETIME,
     )
     return invite.invite_link, name
 
@@ -2353,7 +2352,6 @@ async def create_one_use_invite_link_for_chat(bot: Bot, chat_id: int | str, tele
         chat_id=chat_id,
         name=name,
         member_limit=1,
-        expire_date=datetime.now(timezone.utc) + INVITE_LINK_LIFETIME,
     )
     return invite.invite_link, name
 
