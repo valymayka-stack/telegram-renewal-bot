@@ -1436,31 +1436,6 @@ def payment_selection_key(callback_query: CallbackQuery, telegram_id: int) -> tu
     return (callback_query.message.chat.id, callback_query.message.message_id, telegram_id)
 
 
-async def delete_pending_payment_admin_messages(bot: Bot, selection_key: tuple[int, int, int] | None) -> None:
-    if not selection_key:
-        return
-    chat_id, admin_message_id, telegram_id = selection_key
-    receipt_message_id = PENDING_PAYMENT_ADMIN_MESSAGES.pop((chat_id, admin_message_id), None)
-    if not receipt_message_id:
-        logger.warning(
-            "Missing copied receipt message id for pending payment cleanup telegram_id=%s admin_message_id=%s",
-            telegram_id,
-            admin_message_id,
-        )
-    for message_id in (receipt_message_id, admin_message_id):
-        if not message_id:
-            continue
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except Exception:
-            logger.warning(
-                "Could not delete pending payment admin message telegram_id=%s message_id=%s",
-                telegram_id,
-                message_id,
-                exc_info=True,
-            )
-
-
 async def delete_raffle_admin_messages(bot: Bot, admin_message: Message | None) -> None:
     if not admin_message:
         return
@@ -5743,7 +5718,15 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             selection_key = payment_selection_key(callback_query, telegram_id)
             if selection_key:
                 PAYMENT_CHANNEL_SELECTIONS.pop(selection_key, None)
-            await delete_pending_payment_admin_messages(callback_query.bot, selection_key)
+                PENDING_PAYMENT_ADMIN_MESSAGES.pop((selection_key[0], selection_key[1]), None)
+            try:
+                original_text = callback_query.message.text or ""
+                await callback_query.message.edit_text(
+                    f"{original_text}\n\n❌ COMPROBANTE RECHAZADO",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+                )
+            except Exception:
+                logger.warning("Could not clean up rejected payment message telegram_id=%s", telegram_id, exc_info=True)
             await callback_query.answer("Rechazado ❌")
         elif action == "ask_receipt":
             await ask_new_receipt(callback_query.bot, supabase, settings, telegram_id, callback_query.from_user.id)
