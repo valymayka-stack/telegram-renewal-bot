@@ -2620,6 +2620,8 @@ async def approve_payment(
     admin_id: int,
     selected_channel_keys: set[str] | None = None,
 ) -> dict[str, Any]:
+    if await asyncio.to_thread(is_blacklisted, supabase, telegram_id):
+        raise ValueError("Usuario está en blacklist")
     existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
     requested_keys = selected_channel_keys_for_approval(selected_channel_keys)
     if GRUPO_CHANNEL_KEY in requested_keys:
@@ -2690,6 +2692,10 @@ async def approve_payment(
             logger.error("Selected approval channel is missing telegram_chat_id: %s", channel)
             raise ValueError(f"Canal {channel_label(channel)} no tiene telegram_chat_id configurado.")
         chat_id = parse_stored_chat_id(telegram_chat_id)
+        try:
+            await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+        except Exception:
+            logger.warning("Could not unban before generating invite link telegram_id=%s chat_id=%s", telegram_id, chat_id, exc_info=True)
         generated_link, generated_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, code)
         await asyncio.to_thread(
             save_user_channel_access,
