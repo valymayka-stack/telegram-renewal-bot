@@ -52,6 +52,21 @@ HIDDEN_APPROVAL_CHANNEL_CODES = {
     "regalo_partido",
     "nuevos_sus",
     "blue_love",
+    "cherry",
+    "red_cream",
+    "nico_robin",
+    "mexico_en_la_piel",
+    "purple_bloom",
+    "rosario_tijeras",
+    "eva",
+    "orange_flame",
+    "blue_moon",
+    "paraiso",
+    "hot_bath",
+    "redish",
+    "marissa_chivis",
+    "black_pearl",
+    "special",
 }
 PREDICTION_MEX_INGLATERRA_GAME_CODE = "mex_inglaterra"
 PREDICTION_MEX_INGLATERRA_SCORES = [
