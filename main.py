@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import httpx
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
@@ -391,6 +392,12 @@ class Settings:
     auto_remove_expired: bool
     renewal_notice_days: tuple[int, ...]
     master_channel_id: int | str | None
+    # Onyx bridge (2026-08) — all four optional/default-off, see the
+    # onyx_provisioning_enabled docstring below for what each one gates.
+    onyx_api_url: str | None
+    onyx_provision_secret: str | None
+    onyx_bridge_secret: str | None
+    onyx_provisioning_enabled: bool
 
 
 def configure_logging() -> None:
@@ -467,6 +474,15 @@ def load_settings() -> Settings:
         auto_remove_expired=parse_bool(os.getenv("AUTO_REMOVE_EXPIRED"), default=False),
         renewal_notice_days=parse_notice_days(os.getenv("RENEWAL_NOTICE_DAYS")),
         master_channel_id=parse_chat_id(os.environ["MASTER_CHANNEL_ID"]) if os.getenv("MASTER_CHANNEL_ID") else None,
+        # All four unset/false by default — every new code path this
+        # enables (see approve_payment and the /onyx/* routes in
+        # create_web_app) falls straight back to today's behavior until
+        # these are set in Railway and ONYX_PROVISIONING_ENABLED is
+        # explicitly turned on. Built ahead of time, not activated yet.
+        onyx_api_url=os.getenv("ONYX_API_URL"),
+        onyx_provision_secret=os.getenv("ONYX_PROVISION_SECRET"),
+        onyx_bridge_secret=os.getenv("ONYX_BRIDGE_SECRET"),
+        onyx_provisioning_enabled=parse_bool(os.getenv("ONYX_PROVISIONING_ENABLED"), default=False),
     )
 
 
@@ -2627,6 +2643,51 @@ async def send_featured_cross_sell(bot: Bot, supabase: Client, settings: Setting
         logger.exception("Could not send featured cross-sell telegram_id=%s", telegram_id)
 
 
+# Onyx bridge (2026-08) — best-effort, never raises. Returns None whenever
+# the bridge isn't configured (ONYX_API_URL/ONYX_PROVISION_SECRET unset) or
+# the request itself fails or Onyx has no collection for this channel_code,
+# so every caller can fall back to the pre-Onyx behavior for that channel
+# rather than fail the whole approval. Not called from anywhere yet unless
+# ONYX_PROVISIONING_ENABLED is explicitly turned on — see approve_payment.
+async def notify_onyx_provision(
+    settings: Settings, telegram_id: int, channel_code_value: str
+) -> dict[str, Any] | None:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return None
+    password = secrets.token_urlsafe(12)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{settings.onyx_api_url}/api/bot/provision-fan",
+                json={
+                    "telegramId": str(telegram_id),
+                    "password": password,
+                    "channelCode": channel_code_value,
+                },
+                headers={"x-bot-secret": settings.onyx_provision_secret},
+            )
+    except Exception:
+        logger.exception(
+            "Onyx provision-fan request failed telegram_id=%s channel=%s", telegram_id, channel_code_value
+        )
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "Onyx provision-fan rejected telegram_id=%s channel=%s status=%s body=%s",
+            telegram_id,
+            channel_code_value,
+            response.status_code,
+            response.text,
+        )
+        return None
+    data = response.json()
+    if data.get("isNewAccount"):
+        # Onyx never echoes the password back — it's only known here,
+        # since we generated it for this call.
+        data["password"] = password
+    return data
+
+
 async def approve_payment(
     bot: Bot,
     supabase: Client,
@@ -2702,6 +2763,25 @@ async def approve_payment(
                 }
             )
             continue
+        # Onyx bridge (2026-08) — off by default (ONYX_PROVISIONING_ENABLED
+        # unset). Grupo and watermark_delivery channels never reach this
+        # line (both `continue` above), so neither path changes regardless
+        # of this flag. When on, notify_onyx_provision only touches
+        # *channels Onyx actually has a collection for* — anything else
+        # falls straight through to the exact invite-link code that already
+        # runs today, unchanged.
+        if settings.onyx_provisioning_enabled:
+            onyx_result = await notify_onyx_provision(settings, telegram_id, code)
+            if onyx_result is not None:
+                if onyx_result.get("isNewAccount"):
+                    access_note = (
+                        f"Accede en onyx.com — usuario: {onyx_result['email']} · "
+                        f"contraseña: {onyx_result['password']}"
+                    )
+                else:
+                    access_note = "Se agregó a tu cuenta de Onyx — usa tu mismo usuario y contraseña de siempre."
+                channel_links.append({"label": channel_label(channel), "invite_link": access_note})
+                continue
         telegram_chat_id = channel_telegram_chat_id(channel)
         if not telegram_chat_id:
             logger.error("Selected approval channel is missing telegram_chat_id: %s", channel)
@@ -6346,6 +6426,84 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     @app.get("/health", response_model=None)
     async def health():
         return {"status": "ok"}
+
+    # Onyx bridge (2026-08) — these two routes exist as soon as this
+    # deploys, but nothing calls them until Onyx's own
+    # TELEGRAM_BOT_BRIDGE_URL/_SECRET are set (they aren't yet), so adding
+    # them changes no existing behavior on their own. ONYX_BRIDGE_SECRET
+    # unset means both reject with 401 unconditionally either way.
+    def onyx_bridge_authorized(request: Request) -> bool:
+        provided = request.headers.get("x-onyx-bridge-secret")
+        if not settings.onyx_bridge_secret or not provided:
+            return False
+        return secrets.compare_digest(provided, settings.onyx_bridge_secret)
+
+    @app.post("/onyx/request-invite", response_model=None)
+    async def onyx_request_invite(request: Request):
+        if not onyx_bridge_authorized(request):
+            return Response(status_code=401)
+        body = await request.json()
+        telegram_id_raw = body.get("telegramId")
+        channel_codes = body.get("channelCodes")
+        if not telegram_id_raw or not isinstance(channel_codes, list) or not channel_codes:
+            return Response(status_code=400)
+        try:
+            telegram_id = int(telegram_id_raw)
+        except (TypeError, ValueError):
+            return Response(status_code=400)
+
+        available_channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        channels_by_code = {channel_code(c): c for c in available_channels}
+        channel_links: list[dict[str, str]] = []
+        for code in channel_codes:
+            channel = channels_by_code.get(code)
+            if not channel:
+                logger.warning("Onyx requested invite for unknown channel_code=%s", code)
+                continue
+            chat_id_raw = channel_telegram_chat_id(channel)
+            if not chat_id_raw:
+                logger.warning("Onyx-requested channel missing telegram_chat_id: %s", code)
+                continue
+            chat_id = parse_stored_chat_id(chat_id_raw)
+            try:
+                await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+            except Exception:
+                logger.warning(
+                    "Could not unban before generating Onyx-requested invite telegram_id=%s chat_id=%s",
+                    telegram_id,
+                    chat_id,
+                    exc_info=True,
+                )
+            generated_link, generated_name = await create_one_use_invite_link_for_chat(
+                bot, chat_id, telegram_id, code
+            )
+            await asyncio.to_thread(
+                save_user_channel_access, supabase, telegram_id, channel, generated_link, generated_name, None
+            )
+            channel_links.append({"label": channel_label(channel), "invite_link": generated_link})
+
+        if not channel_links:
+            return {"ok": False, "delivered": []}
+
+        dm_sent = await send_channel_invites_to_user(bot, telegram_id, channel_links)
+        return {"ok": dm_sent, "delivered": [c["label"] for c in channel_links]}
+
+    @app.post("/onyx/ban", response_model=None)
+    async def onyx_ban(request: Request):
+        if not onyx_bridge_authorized(request):
+            return Response(status_code=401)
+        body = await request.json()
+        telegram_id_raw = body.get("telegramId")
+        reason = body.get("reason") or "Banned from Onyx"
+        try:
+            telegram_id = int(telegram_id_raw)
+        except (TypeError, ValueError):
+            return Response(status_code=400)
+        removed_from = await sweep_blacklisted_user_from_all_channels(bot, supabase, settings, telegram_id)
+        logger.info(
+            "Onyx ban propagated telegram_id=%s reason=%s removed_from=%s", telegram_id, reason, removed_from
+        )
+        return {"ok": True, "removedFrom": removed_from}
 
     @app.get("/", response_class=HTMLResponse, response_model=None)
     async def root(request: Request):
