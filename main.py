@@ -2775,11 +2775,14 @@ async def approve_payment(
             if onyx_result is not None:
                 if onyx_result.get("isNewAccount"):
                     access_note = (
-                        f"Accede en onyx.com — usuario: {onyx_result['email']} · "
+                        f"Accede en {settings.onyx_api_url} — usuario: {onyx_result['email']} · "
                         f"contraseña: {onyx_result['password']}"
                     )
                 else:
-                    access_note = "Se agregó a tu cuenta de Onyx — usa tu mismo usuario y contraseña de siempre."
+                    access_note = (
+                        f"Se agregó a tu cuenta de Onyx ({settings.onyx_api_url}) — "
+                        f"usa tu mismo usuario y contraseña de siempre."
+                    )
                 channel_links.append({"label": channel_label(channel), "invite_link": access_note})
                 continue
         telegram_chat_id = channel_telegram_chat_id(channel)
