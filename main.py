@@ -6521,6 +6521,86 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         dm_sent = await send_channel_invites_to_user(bot, telegram_id, channel_links)
         return {"ok": dm_sent, "delivered": [c["label"] for c in channel_links]}
 
+    @app.post("/onyx/revoke-telegram-access", response_model=None)
+    async def onyx_revoke_telegram_access(request: Request):
+        # Called when a fan switches from Telegram to the Onyx Android app
+        # (see middleware.ts's deliveryChannel enforcement) — a device
+        # switch, not an abuse ban, so this kicks (removable, not a
+        # blacklist entry) rather than going through the ban/blacklist path.
+        if not onyx_bridge_authorized(request):
+            return Response(status_code=401)
+        body = await request.json()
+        telegram_id_raw = body.get("telegramId")
+        channel_codes = body.get("channelCodes")
+        if not telegram_id_raw or not isinstance(channel_codes, list) or not channel_codes:
+            return Response(status_code=400)
+        try:
+            telegram_id = int(telegram_id_raw)
+        except (TypeError, ValueError):
+            return Response(status_code=400)
+
+        available_channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        channels_by_code = {channel_code(c): c for c in available_channels}
+        removed_from: list[str] = []
+        for code in channel_codes:
+            channel = channels_by_code.get(code)
+            if not channel:
+                continue
+            chat_id_raw = channel_telegram_chat_id(channel)
+            if not chat_id_raw:
+                continue
+            chat_id = parse_stored_chat_id(chat_id_raw)
+
+            access = await asyncio.to_thread(get_user_channel_access, supabase, telegram_id, code)
+            if access and access.get("invite_link") and not access.get("invite_link_revoked"):
+                try:
+                    await bot.revoke_chat_invite_link(chat_id, access["invite_link"])
+                except Exception:
+                    logger.warning(
+                        "Could not revoke invite link telegram_id=%s channel=%s",
+                        telegram_id,
+                        code,
+                        exc_info=True,
+                    )
+                try:
+                    (
+                        supabase.table("user_channel_access")
+                        .update({"invite_link_revoked": True, "updated_at": now_utc_iso()})
+                        .eq("telegram_id", telegram_id)
+                        .eq("channel_key", code)
+                        .execute()
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not mark invite_link_revoked telegram_id=%s channel=%s",
+                        telegram_id,
+                        code,
+                        exc_info=True,
+                    )
+
+            try:
+                member = await bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
+            except Exception:
+                continue
+            if member.status not in ACTIVE_MEMBER_STATUSES:
+                continue
+            try:
+                await bot.ban_chat_member(chat_id=chat_id, user_id=telegram_id)
+                await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+                removed_from.append(channel_label(channel))
+            except Exception:
+                logger.warning(
+                    "Could not remove telegram_id=%s from channel=%s (device switch)",
+                    telegram_id,
+                    code,
+                    exc_info=True,
+                )
+
+        logger.info(
+            "Onyx device-switch revoke telegram_id=%s removed_from=%s", telegram_id, removed_from
+        )
+        return {"ok": True, "removedFrom": removed_from}
+
     @app.post("/onyx/ban", response_model=None)
     async def onyx_ban(request: Request):
         if not onyx_bridge_authorized(request):
