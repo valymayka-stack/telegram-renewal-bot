@@ -2458,6 +2458,27 @@ def save_user_channel_access(
         )
 
 
+def get_user_channel_access(supabase: Client, telegram_id: int, channel_key: str) -> dict[str, Any] | None:
+    try:
+        response = (
+            supabase.table("user_channel_access")
+            .select("*")
+            .eq("telegram_id", telegram_id)
+            .eq("channel_key", channel_key)
+            .maybe_single()
+            .execute()
+        )
+        return response.data
+    except Exception:
+        logger.warning(
+            "Could not read user_channel_access telegram_id=%s channel_key=%s",
+            telegram_id,
+            channel_key,
+            exc_info=True,
+        )
+        return None
+
+
 async def revoke_invite_for_user(
     bot: Bot,
     supabase: Client,
@@ -6468,6 +6489,15 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
                 logger.warning("Onyx-requested channel missing telegram_chat_id: %s", code)
                 continue
             chat_id = parse_stored_chat_id(chat_id_raw)
+
+            # Onyx calls this on every visit to the iPhone gate page, not
+            # just once — without this check each visit generated (and DM'd)
+            # a brand-new single-use link, spamming the fan's Telegram chat.
+            existing_access = await asyncio.to_thread(get_user_channel_access, supabase, telegram_id, code)
+            if has_active_unused_invite(existing_access):
+                channel_links.append({"label": channel_label(channel), "invite_link": existing_access["invite_link"]})
+                continue
+
             try:
                 await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
             except Exception:
