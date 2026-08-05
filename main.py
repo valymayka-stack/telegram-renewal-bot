@@ -4955,6 +4955,17 @@ async def send_manual_link(message: Message, settings: Settings, supabase: Clien
                     await report_credential_delivery(settings, telegram_id, requested_code, "blocked")
                     raise
                 await report_credential_delivery(settings, telegram_id, requested_code, "sent")
+                # No Telegram invite link exists on this path (Onyx handles
+                # delivery from here), but /migrar_canal and /barrer_canal
+                # only ever see a telegram_id for this channel if it's
+                # recorded somewhere — registering it here (empty invite
+                # fields, nothing to revoke/reuse) is what makes a manually
+                # onyx-granted user show up in a future sweep instead of
+                # being invisible to it like someone who was never tracked
+                # at all.
+                await asyncio.to_thread(
+                    save_user_channel_access, supabase, telegram_id, channel, "", "onyx-manual-link", None
+                )
                 await message.answer(f"Otorgado vía Onyx a {telegram_id}.")
                 return
 
