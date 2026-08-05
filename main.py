@@ -124,9 +124,9 @@ CART_CATEGORIES = {"eterea": "Etérea", "casera": "Casera"}
 CART_DISCOUNT_MIN_SETS = 3
 CART_DISCOUNT_RATE = 0.10
 CART_PAYMENT_INFO = (
-    "💳 Cuenta CLABE (BBVA)\n"
+    "💳 Cuenta (Banamex)\n"
     "Silvia Montalvo\n"
-    "012700015287595938\n\n"
+    "002700702259156932\n\n"
     "🌎 ¿Eres extranjero?\n"
     "Puedes hacer tu depósito directo por Felix, Xoom o Remitly.\n"
     "Datos adicionales que te pueden pedir:\n"
