@@ -46,6 +46,13 @@ CONFIRM_SUBSCRIPTION_CALLBACK_DATA = "confirm_subscription_v1"
 CONFIRMATION_CAMPAIGN = "subscription_confirmation_v1"
 CONFIRMATION_SOURCE = "confirm_subscription_button"
 INVITE_LINK_LIFETIME = timedelta(hours=24)
+# Allen and Juan (2026-08) — granted access directly outside any tracked
+# flow, by deliberate admin decision never to route them through Onyx at
+# all. Filtered out of every channel's tracked list at the source
+# (get_user_channel_access_rows_for_channel), not per-command, so
+# /migrar_canal, /barrer_canal, and /forzar_corte_canal all honor this the
+# same way for any channel, not just the ones they were manually granted on.
+EXCLUDED_FROM_ONYX_MIGRATION = {7181945778, 5573550005}
 HIDDEN_APPROVAL_CHANNEL_CODES = {
     "regalo_renovacion",
     "regalo_marcador_exacto",
@@ -2576,7 +2583,7 @@ def get_user_channel_access_rows_for_channel(supabase: Client, channel: dict[str
             "Could not search payment_history for channel_code=%s", channel_key, exc_info=True
         )
 
-    return rows
+    return [row for row in rows if row.get("telegram_id") not in EXCLUDED_FROM_ONYX_MIGRATION]
 
 
 async def revoke_invite_for_user(
@@ -5307,14 +5314,16 @@ async def run_sweep_channel(
     await notify(summary)
 
 
-# Forced cutover (2026-08) — unlike run_sweep_channel (a safety net that only
-# removes people who never got their Onyx grant, e.g. a failed migration
-# attempt), this removes everyone who *does* have the grant already,
-# regardless of whether they've actually logged into Onyx yet. Use this when
-# the decision has already been made to force a channel off Telegram
-# entirely right now, not to wait out a grace period — e.g. right after a
-# clean /migrar_canal run where everyone was successfully provisioned, so
-# run_sweep_channel alone would find nobody to remove.
+# Forced cutover (2026-08) — unlike run_sweep_channel (a safety net keyed on
+# whether Onyx *granted* access, which happens the moment the bot provisions
+# someone regardless of whether they ever log in — so right after a clean
+# migration, everyone already qualifies as "granted" and run_sweep_channel
+# finds nobody to remove), this is keyed on whether the fan has actually
+# *logged into* Onyx at least once. Removes anyone tracked for this channel
+# who hasn't — the ones who have (like someone already actively using it on
+# their iPhone, getting a fresh one-time Telegram link each visit) are left
+# alone, since the standing channel membership isn't how they're being
+# served content anymore either way.
 async def run_force_cutover_channel(
     bot: Bot,
     supabase: Client,
@@ -5346,13 +5355,13 @@ async def run_force_cutover_channel(
 
     await notify(
         f"{'Ejecutando' if confirm else 'Simulando (dry-run)'} corte definitivo de {len(telegram_ids)} usuario(s) en "
-        f"{channel_label(channel)} ({requested_code}). Remueve a quien YA tiene acceso otorgado en Onyx, sin "
-        f"importar si ya inició sesión. Esto puede tardar varios minutos."
+        f"{channel_label(channel)} ({requested_code}). Remueve a quien NO ha iniciado sesión en Onyx todavía. "
+        f"Esto puede tardar varios minutos."
     )
 
     left_channel = 0
     unknown_skipped = 0
-    not_yet_granted = 0
+    already_logged_in = 0
     to_remove: list[int] = []
 
     for telegram_id in telegram_ids:
@@ -5373,8 +5382,8 @@ async def run_force_cutover_channel(
         if requested_code in access_check.get("unknownCodes", []):
             await notify(f"Abortado: el canal '{requested_code}' no está vinculado a ninguna colección en Onyx.")
             return
-        if requested_code not in access_check.get("granted", []):
-            not_yet_granted += 1
+        if access_check.get("loggedIn"):
+            already_logged_in += 1
             await asyncio.sleep(1.0)
             continue
 
@@ -5404,7 +5413,7 @@ async def run_force_cutover_channel(
         f"Total en la lista: {len(telegram_ids)}\n"
         f"Ya no estaban en el canal: {left_channel}\n"
         f"No se pudo verificar (se dejan intactos por seguridad): {unknown_skipped}\n"
-        f"Aún no tienen Onyx otorgado (se dejan, no están listos): {not_yet_granted}\n"
+        f"Ya iniciaron sesión en Onyx (se quedan): {already_logged_in}\n"
     )
     if confirm:
         summary += f"Removidos del canal: {removed}\n"
