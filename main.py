@@ -2889,8 +2889,6 @@ async def approve_payment(
         raise ValueError("Usuario está en blacklist")
     existing_user = await asyncio.to_thread(get_registered_user, supabase, telegram_id)
     requested_keys = selected_channel_keys_for_approval(selected_channel_keys)
-    if GRUPO_CHANNEL_KEY in requested_keys:
-        requested_keys = requested_keys | GRUPO_BUNDLED_CHANNEL_KEYS
     available_channels = await asyncio.to_thread(get_access_channels, supabase, settings)
     selected_channels = [
         channel
