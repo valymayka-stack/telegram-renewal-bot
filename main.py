@@ -2479,6 +2479,22 @@ def get_user_channel_access(supabase: Client, telegram_id: int, channel_key: str
         return None
 
 
+def get_user_channel_access_rows_for_channel(supabase: Client, channel_key: str) -> list[dict[str, Any]]:
+    try:
+        response = (
+            supabase.table("user_channel_access")
+            .select("telegram_id")
+            .eq("channel_key", channel_key)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        logger.warning(
+            "Could not list user_channel_access rows for channel_key=%s", channel_key, exc_info=True
+        )
+        return []
+
+
 async def revoke_invite_for_user(
     bot: Bot,
     supabase: Client,
@@ -2707,6 +2723,38 @@ async def notify_onyx_provision(
         # since we generated it for this call.
         data["password"] = password
     return data
+
+
+# Read-only counterpart to notify_onyx_provision — never creates an account
+# or grants anything, just reports what already exists. Used by the channel
+# migration/sweep commands: migration treats a failed/unknown check as "go
+# ahead and provision anyway" (worst case, a harmless repeat message), while
+# the sweep treats it as "don't touch this person" (removing a real member
+# on a false read is the one mistake that isn't easily undone).
+async def check_onyx_access(
+    settings: Settings, telegram_id: int, channel_codes: list[str]
+) -> dict[str, Any] | None:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{settings.onyx_api_url}/api/bot/check-fan-access",
+                json={"telegramId": str(telegram_id), "channelCodes": channel_codes},
+                headers={"x-bot-secret": settings.onyx_provision_secret},
+            )
+    except Exception:
+        logger.exception("Onyx check-fan-access request failed telegram_id=%s", telegram_id)
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "Onyx check-fan-access rejected telegram_id=%s status=%s body=%s",
+            telegram_id,
+            response.status_code,
+            response.text,
+        )
+        return None
+    return response.json()
 
 
 async def approve_payment(
@@ -4800,6 +4848,235 @@ async def send_manual_link(message: Message, settings: Settings, supabase: Clien
         return
 
     await message.answer(f"Link enviado a {telegram_id}.")
+
+
+# Onyx migration (2026-08) — moves people who joined a channel before it was
+# bridged to Onyx onto the same login-and-device-detection flow as everyone
+# approved afterward. Two-phase and channel-by-channel on purpose: phase one
+# only ever adds access and messages people (safe to re-run, already-migrated
+# users are skipped via check_onyx_access rather than re-provisioned/re-DM'd);
+# phase two is the only one that removes anyone, defaults to a dry run, and
+# only touches people it could positively confirm still lack Onyx access —
+# anyone check_onyx_access couldn't verify is left alone rather than guessed
+# at. Paced with asyncio.sleep between iterations mainly to stay under Onyx's
+# own /api/bot/provision-fan rate limit (20 requests/minute from this bot's
+# IP), not because the web app itself struggles with bulk traffic.
+@router.message(Command("migrar_canal"))
+async def migrar_canal_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer("Uso: /migrar_canal <channel_key>")
+        return
+    requested_code = parts[1].strip()
+
+    if not settings.onyx_provisioning_enabled or not settings.onyx_api_url or not settings.onyx_provision_secret:
+        await message.answer(
+            "El bridge de Onyx no está activo (ONYX_PROVISIONING_ENABLED/ONYX_API_URL/ONYX_PROVISION_SECRET)."
+        )
+        return
+
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
+    if not channel:
+        available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+        await message.answer(f"Canal no encontrado. Códigos disponibles: {available_codes}")
+        return
+    telegram_chat_id = channel_telegram_chat_id(channel)
+    if not telegram_chat_id:
+        await message.answer(f"Canal {requested_code} no tiene telegram_chat_id configurado.")
+        return
+    chat_id = parse_stored_chat_id(telegram_chat_id)
+
+    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, requested_code)
+    telegram_ids = sorted({int(row["telegram_id"]) for row in rows if row.get("telegram_id") is not None})
+    if not telegram_ids:
+        await message.answer(f"No hay usuarios registrados en user_channel_access para el canal {requested_code}.")
+        return
+
+    await message.answer(
+        f"Iniciando migración a Onyx de {len(telegram_ids)} usuario(s) en {channel_label(channel)} "
+        f"({requested_code}). Esto puede tardar varios minutos, aviso cuando termine."
+    )
+
+    already_migrated = 0
+    left_channel = 0
+    migrated_new = 0
+    migrated_existing = 0
+    dm_blocked = 0
+    onyx_errors = 0
+    aborted = False
+
+    for i, telegram_id in enumerate(telegram_ids):
+        try:
+            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
+            if member.status not in ACTIVE_MEMBER_STATUSES:
+                left_channel += 1
+                continue
+        except Exception:
+            left_channel += 1
+            continue
+
+        access_check = await check_onyx_access(settings, telegram_id, [requested_code])
+        if access_check and requested_code in access_check.get("unknownCodes", []):
+            await message.answer(
+                f"Abortado: el canal '{requested_code}' no está vinculado a ninguna colección en Onyx."
+            )
+            aborted = True
+            break
+        if access_check and requested_code in access_check.get("granted", []):
+            already_migrated += 1
+            continue
+
+        onyx_result = await notify_onyx_provision(settings, telegram_id, requested_code)
+        if onyx_result is None:
+            onyx_errors += 1
+            if i == 0:
+                await message.answer(
+                    "Abortado tras fallar el primer usuario — revisa que Onyx esté arriba y el bridge configurado."
+                )
+                aborted = True
+                break
+            continue
+
+        if onyx_result.get("isNewAccount"):
+            text = (
+                f"Para seguir teniendo acceso a {channel_label(channel)}, activa tu cuenta de Onyx aquí: "
+                f"{settings.onyx_api_url}\nUsuario: {onyx_result['email']}\nContraseña: {onyx_result['password']}\n\n"
+                "Entra con esos datos cuando quieras — ya no necesitas un link de Telegram para este canal."
+            )
+            migrated_new += 1
+        else:
+            text = (
+                f"Para seguir teniendo acceso a {channel_label(channel)}, entra a tu cuenta de Onyx "
+                f"({settings.onyx_api_url}) con tu mismo usuario y contraseña de siempre."
+            )
+            migrated_existing += 1
+
+        try:
+            await message.bot.send_message(telegram_id, text)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            dm_blocked += 1
+            logger.warning("Could not DM Onyx migration message telegram_id=%s", telegram_id, exc_info=True)
+
+        await asyncio.sleep(3.5)
+
+    summary = (
+        f"Migración {'abortada' if aborted else 'terminada'} para {channel_label(channel)} ({requested_code}).\n"
+        f"Total en la lista: {len(telegram_ids)}\n"
+        f"Ya migrados antes (sin re-mensaje): {already_migrated}\n"
+        f"Cuenta nueva creada y avisada: {migrated_new}\n"
+        f"Cuenta existente, colección agregada y avisada: {migrated_existing}\n"
+        f"Ya no estaban en el canal (omitidos): {left_channel}\n"
+        f"Bloquearon al bot / no se pudo mandar DM: {dm_blocked}\n"
+        f"Errores con Onyx: {onyx_errors}"
+    )
+    await send_long_message(message, summary)
+
+
+@router.message(Command("barrer_canal"))
+async def barrer_canal_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Uso: /barrer_canal <channel_key> [confirmar]")
+        return
+    requested_code = parts[1].strip()
+    confirm = len(parts) == 3 and parts[2].strip().lower() == "confirmar"
+
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        await message.answer("El bridge de Onyx no está configurado (ONYX_API_URL/ONYX_PROVISION_SECRET).")
+        return
+
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
+    if not channel:
+        available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+        await message.answer(f"Canal no encontrado. Códigos disponibles: {available_codes}")
+        return
+    telegram_chat_id = channel_telegram_chat_id(channel)
+    if not telegram_chat_id:
+        await message.answer(f"Canal {requested_code} no tiene telegram_chat_id configurado.")
+        return
+    chat_id = parse_stored_chat_id(telegram_chat_id)
+
+    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, requested_code)
+    telegram_ids = sorted({int(row["telegram_id"]) for row in rows if row.get("telegram_id") is not None})
+    if not telegram_ids:
+        await message.answer(f"No hay usuarios registrados en user_channel_access para el canal {requested_code}.")
+        return
+
+    await message.answer(
+        f"{'Ejecutando' if confirm else 'Simulando (dry-run)'} barrido de {len(telegram_ids)} usuario(s) en "
+        f"{channel_label(channel)} ({requested_code}). Esto puede tardar varios minutos."
+    )
+
+    kept = 0
+    left_channel = 0
+    unknown_skipped = 0
+    to_remove: list[int] = []
+
+    for telegram_id in telegram_ids:
+        try:
+            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
+            if member.status not in ACTIVE_MEMBER_STATUSES:
+                left_channel += 1
+                continue
+        except Exception:
+            left_channel += 1
+            continue
+
+        access_check = await check_onyx_access(settings, telegram_id, [requested_code])
+        if access_check is None:
+            unknown_skipped += 1
+            await asyncio.sleep(1.0)
+            continue
+        if requested_code in access_check.get("unknownCodes", []):
+            await message.answer(
+                f"Abortado: el canal '{requested_code}' no está vinculado a ninguna colección en Onyx."
+            )
+            return
+        if requested_code in access_check.get("granted", []):
+            kept += 1
+            await asyncio.sleep(1.0)
+            continue
+
+        to_remove.append(telegram_id)
+        await asyncio.sleep(1.0)
+
+    removed = 0
+    if confirm:
+        for telegram_id in to_remove:
+            try:
+                await message.bot.ban_chat_member(chat_id=chat_id, user_id=telegram_id)
+                await message.bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+                removed += 1
+            except Exception:
+                logger.warning(
+                    "Could not remove telegram_id=%s from channel=%s (onyx sweep)",
+                    telegram_id,
+                    requested_code,
+                    exc_info=True,
+                )
+            await asyncio.sleep(1.0)
+
+    summary = (
+        f"Barrido {'ejecutado' if confirm else 'simulado'} para {channel_label(channel)} ({requested_code}).\n"
+        f"Total en la lista: {len(telegram_ids)}\n"
+        f"Ya tienen Onyx (se quedan): {kept}\n"
+        f"Ya no estaban en el canal: {left_channel}\n"
+        f"No se pudo verificar (se dejan intactos por seguridad): {unknown_skipped}\n"
+    )
+    if confirm:
+        summary += f"Removidos del canal: {removed}\n"
+    else:
+        summary += (
+            f"Serían removidos si confirmas: {len(to_remove)}\n\n"
+            f"Para ejecutar de verdad: /barrer_canal {requested_code} confirmar"
+        )
+    await send_long_message(message, summary)
 
 
 @router.message(Command("ask_channel"))
