@@ -2354,10 +2354,16 @@ async def create_one_use_invite_link(bot: Bot, settings: Settings, telegram_id: 
 async def create_one_use_invite_link_for_chat(bot: Bot, chat_id: int | str, telegram_id: int, channel_key: str) -> tuple[str, str]:
     timestamp = int(datetime.now(timezone.utc).timestamp())
     name = f"approved-{channel_key}-{telegram_id}-{timestamp}"[:32]
+    # expire_date added 2026-08-05 — without it, member_limit=1 alone leaves
+    # an unused link valid forever (Telegram only auto-invalidates a link
+    # once its member_limit is reached, not on a timer). Found this the hard
+    # way: a channel cutover kicked people whose original approval link had
+    # never been used and was still sitting there as a standing rejoin path.
     invite = await bot.create_chat_invite_link(
         chat_id=chat_id,
         name=name,
         member_limit=1,
+        expire_date=datetime.now(timezone.utc) + INVITE_LINK_LIFETIME,
     )
     return invite.invite_link, name
 
@@ -5149,6 +5155,57 @@ async def run_migrate_channel(
     await notify(summary)
 
 
+# Revokes every invite link the bot has *recorded* for this channel — not
+# just the ones belonging to whoever just got kicked. Once a channel is
+# being cut over to Onyx, any leftover single-use link (create_one_use_
+# invite_link_for_chat never sets an expire_date, so an unused one stays
+# valid forever) is a rejoin path around the whole point of removing
+# someone. Only reaches links this bot actually wrote to
+# user_channel_access — it has no Bot API way to enumerate invite links it
+# doesn't already know the exact string of, so a channel with pre-existing
+# gaps in that tracking (fixed 2026-08-05, but only from that point on)
+# still needs those older links revoked by hand in Telegram's own UI.
+async def revoke_all_tracked_invite_links(
+    bot: Bot, supabase: Client, chat_id: int | str, channel_key: str
+) -> int:
+    try:
+        rows = (
+            supabase.table("user_channel_access")
+            .select("id, invite_link")
+            .eq("channel_code", channel_key)
+            .eq("invite_link_revoked", False)
+            .execute()
+        )
+    except Exception:
+        logger.warning("Could not list invite links to revoke for channel_code=%s", channel_key, exc_info=True)
+        return 0
+
+    revoked = 0
+    for row in rows.data or []:
+        link = row.get("invite_link")
+        if not link:
+            continue
+        try:
+            await bot.revoke_chat_invite_link(chat_id, link)
+        except Exception:
+            logger.warning(
+                "Could not revoke invite_link id=%s for channel_code=%s", row.get("id"), channel_key, exc_info=True
+            )
+            continue
+        try:
+            (
+                supabase.table("user_channel_access")
+                .update({"invite_link_revoked": True, "updated_at": now_utc_iso()})
+                .eq("id", row["id"])
+                .execute()
+            )
+        except Exception:
+            logger.warning("Could not mark invite_link_revoked id=%s", row.get("id"), exc_info=True)
+        revoked += 1
+        await asyncio.sleep(0.3)
+    return revoked
+
+
 async def run_sweep_channel(
     bot: Bot,
     supabase: Client,
@@ -5215,6 +5272,7 @@ async def run_sweep_channel(
         await asyncio.sleep(1.0)
 
     removed = 0
+    revoked_links = 0
     if confirm:
         for telegram_id in to_remove:
             try:
@@ -5229,6 +5287,7 @@ async def run_sweep_channel(
                     exc_info=True,
                 )
             await asyncio.sleep(1.0)
+        revoked_links = await revoke_all_tracked_invite_links(bot, supabase, chat_id, requested_code)
 
     summary = (
         f"Barrido {'ejecutado' if confirm else 'simulado'} para {channel_label(channel)} ({requested_code}).\n"
@@ -5239,6 +5298,7 @@ async def run_sweep_channel(
     )
     if confirm:
         summary += f"Removidos del canal: {removed}\n"
+        summary += f"Links de invitación revocados: {revoked_links}\n"
     else:
         summary += (
             f"Serían removidos si confirmas: {len(to_remove)}\n\n"
@@ -5322,6 +5382,7 @@ async def run_force_cutover_channel(
         await asyncio.sleep(1.0)
 
     removed = 0
+    revoked_links = 0
     if confirm:
         for telegram_id in to_remove:
             try:
@@ -5336,6 +5397,7 @@ async def run_force_cutover_channel(
                     exc_info=True,
                 )
             await asyncio.sleep(1.0)
+        revoked_links = await revoke_all_tracked_invite_links(bot, supabase, chat_id, requested_code)
 
     summary = (
         f"Corte {'ejecutado' if confirm else 'simulado'} para {channel_label(channel)} ({requested_code}).\n"
@@ -5346,6 +5408,7 @@ async def run_force_cutover_channel(
     )
     if confirm:
         summary += f"Removidos del canal: {removed}\n"
+        summary += f"Links de invitación revocados: {revoked_links}\n"
     else:
         summary += (
             f"Serían removidos si confirmas: {len(to_remove)}\n\n"
