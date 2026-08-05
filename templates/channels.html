@@ -138,6 +138,7 @@
                 <th>Código</th>
                 <th>Migrar</th>
                 <th>Barrer</th>
+                <th>Corte definitivo</th>
               </tr>
             </thead>
             <tbody>
@@ -156,6 +157,13 @@
                           onsubmit="return confirm(this.confirm.checked ? '¿Remover de verdad a quienes no tengan Onyx en {{ ch.label }}?' : 'Simular barrido (dry-run) de {{ ch.label }}?');">
                       <label><input type="checkbox" name="confirm" value="yes"> confirmar</label>
                       <button class="button danger" type="submit">Barrer canal</button>
+                    </form>
+                  </td>
+                  <td>
+                    <form class="sweep-form" method="post" action="/dashboard/channels/{{ ch.code }}/force-cutover"
+                          onsubmit="return confirm(this.confirm.checked ? '¿Remover YA de Telegram a todos los que ya tienen Onyx otorgado en {{ ch.label }}, sin importar si ya iniciaron sesión?' : 'Simular corte definitivo (dry-run) de {{ ch.label }}?');">
+                      <label><input type="checkbox" name="confirm" value="yes"> confirmar</label>
+                      <button class="button danger" type="submit">Forzar corte</button>
                     </form>
                   </td>
                 </tr>

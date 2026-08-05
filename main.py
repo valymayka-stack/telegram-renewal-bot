@@ -5242,6 +5242,113 @@ async def run_sweep_channel(
     await notify(summary)
 
 
+# Forced cutover (2026-08) — unlike run_sweep_channel (a safety net that only
+# removes people who never got their Onyx grant, e.g. a failed migration
+# attempt), this removes everyone who *does* have the grant already,
+# regardless of whether they've actually logged into Onyx yet. Use this when
+# the decision has already been made to force a channel off Telegram
+# entirely right now, not to wait out a grace period — e.g. right after a
+# clean /migrar_canal run where everyone was successfully provisioned, so
+# run_sweep_channel alone would find nobody to remove.
+async def run_force_cutover_channel(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    requested_code: str,
+    confirm: bool,
+    notify: Callable[[str], Awaitable[None]],
+) -> None:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        await notify("El bridge de Onyx no está configurado (ONYX_API_URL/ONYX_PROVISION_SECRET).")
+        return
+
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
+    if not channel:
+        available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+        await notify(f"Canal no encontrado. Códigos disponibles: {available_codes}")
+        return
+    telegram_chat_id = channel_telegram_chat_id(channel)
+    if not telegram_chat_id:
+        await notify(f"Canal {requested_code} no tiene telegram_chat_id configurado.")
+        return
+    chat_id = parse_stored_chat_id(telegram_chat_id)
+
+    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, channel)
+    telegram_ids = sorted({int(row["telegram_id"]) for row in rows if row.get("telegram_id") is not None})
+    if not telegram_ids:
+        await notify(f"No hay usuarios registrados para el canal {requested_code}.")
+        return
+
+    await notify(
+        f"{'Ejecutando' if confirm else 'Simulando (dry-run)'} corte definitivo de {len(telegram_ids)} usuario(s) en "
+        f"{channel_label(channel)} ({requested_code}). Remueve a quien YA tiene acceso otorgado en Onyx, sin "
+        f"importar si ya inició sesión. Esto puede tardar varios minutos."
+    )
+
+    left_channel = 0
+    unknown_skipped = 0
+    not_yet_granted = 0
+    to_remove: list[int] = []
+
+    for telegram_id in telegram_ids:
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
+            if member.status not in ACTIVE_MEMBER_STATUSES:
+                left_channel += 1
+                continue
+        except Exception:
+            left_channel += 1
+            continue
+
+        access_check = await check_onyx_access(settings, telegram_id, [requested_code])
+        if access_check is None:
+            unknown_skipped += 1
+            await asyncio.sleep(1.0)
+            continue
+        if requested_code in access_check.get("unknownCodes", []):
+            await notify(f"Abortado: el canal '{requested_code}' no está vinculado a ninguna colección en Onyx.")
+            return
+        if requested_code not in access_check.get("granted", []):
+            not_yet_granted += 1
+            await asyncio.sleep(1.0)
+            continue
+
+        to_remove.append(telegram_id)
+        await asyncio.sleep(1.0)
+
+    removed = 0
+    if confirm:
+        for telegram_id in to_remove:
+            try:
+                await bot.ban_chat_member(chat_id=chat_id, user_id=telegram_id)
+                await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+                removed += 1
+            except Exception:
+                logger.warning(
+                    "Could not remove telegram_id=%s from channel=%s (forced cutover)",
+                    telegram_id,
+                    requested_code,
+                    exc_info=True,
+                )
+            await asyncio.sleep(1.0)
+
+    summary = (
+        f"Corte {'ejecutado' if confirm else 'simulado'} para {channel_label(channel)} ({requested_code}).\n"
+        f"Total en la lista: {len(telegram_ids)}\n"
+        f"Ya no estaban en el canal: {left_channel}\n"
+        f"No se pudo verificar (se dejan intactos por seguridad): {unknown_skipped}\n"
+        f"Aún no tienen Onyx otorgado (se dejan, no están listos): {not_yet_granted}\n"
+    )
+    if confirm:
+        summary += f"Removidos del canal: {removed}\n"
+    else:
+        summary += (
+            f"Serían removidos si confirmas: {len(to_remove)}\n\n"
+            f"Para ejecutar de verdad: /forzar_corte_canal {requested_code} confirmar"
+        )
+    await notify(summary)
+
+
 @router.message(Command("migrar_canal"))
 async def migrar_canal_command(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -5275,6 +5382,24 @@ async def barrer_canal_command(message: Message, settings: Settings, supabase: C
         await send_long_message(message, text)
 
     await run_sweep_channel(message.bot, supabase, settings, requested_code, confirm, notify)
+
+
+@router.message(Command("forzar_corte_canal"))
+async def forzar_corte_canal_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Uso: /forzar_corte_canal <channel_key> [confirmar]")
+        return
+    requested_code = parts[1].strip()
+    confirm = len(parts) == 3 and parts[2].strip().lower() == "confirmar"
+
+    async def notify(text: str) -> None:
+        await send_long_message(message, text)
+
+    await run_force_cutover_channel(message.bot, supabase, settings, requested_code, confirm, notify)
 
 
 @router.message(Command("ask_channel"))
@@ -7642,6 +7767,32 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             message=(
                 f"Barrido {'de verdad' if is_confirm else '(dry-run)'} de '{channel_key}' iniciado en segundo "
                 "plano — el resumen llega al chat de administración."
+            )
+        )
+
+    @app.post("/dashboard/channels/{channel_key}/force-cutover", response_model=None)
+    async def dashboard_force_cutover_channel(
+        channel_key: str,
+        request: Request,
+        confirm: str | None = Form(None),
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        is_confirm = confirm == "yes"
+
+        async def notify_admin(text: str) -> None:
+            try:
+                await bot.send_message(settings.admin_chat_id, text)
+            except Exception:
+                logger.warning("Could not notify admin_chat_id with force-cutover update", exc_info=True)
+
+        spawn_background(
+            run_force_cutover_channel(bot, supabase, settings, channel_key, is_confirm, notify_admin)
+        )
+        return channels_redirect(
+            message=(
+                f"Corte definitivo {'de verdad' if is_confirm else '(dry-run)'} de '{channel_key}' iniciado en "
+                "segundo plano — el resumen llega al chat de administración."
             )
         )
 
