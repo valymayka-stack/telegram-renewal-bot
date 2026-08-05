@@ -4816,6 +4816,32 @@ async def send_manual_link(message: Message, settings: Settings, supabase: Clien
             await message.answer(f"Canal {requested_code} no tiene telegram_chat_id configurado.")
             return
 
+        # Onyx bridge (2026-08) — same preference as approve_payment: if this
+        # channel has an Onyx collection, provision/grant it and let Onyx's
+        # own device detection decide what the fan sees next (app: shows up
+        # in their feed already logged in; iPhone: they get a one-time
+        # Telegram invite the next time they visit Onyx, not from this
+        # command directly). Falls back to the plain manual Telegram link
+        # below only when the bridge is off or this channel isn't one Onyx
+        # has a collection for.
+        if settings.onyx_provisioning_enabled:
+            onyx_result = await notify_onyx_provision(settings, telegram_id, requested_code)
+            if onyx_result is not None:
+                if onyx_result.get("isNewAccount"):
+                    text = (
+                        f"Para acceder a {channel_label(channel)}, activa tu cuenta de Onyx aquí: "
+                        f"{settings.onyx_api_url}\nUsuario: {onyx_result['email']}\n"
+                        f"Contraseña: {onyx_result['password']}"
+                    )
+                else:
+                    text = (
+                        f"Se agregó {channel_label(channel)} a tu cuenta de Onyx ({settings.onyx_api_url}) — "
+                        "usa tu mismo usuario y contraseña de siempre."
+                    )
+                await message.bot.send_message(telegram_id, text)
+                await message.answer(f"Otorgado vía Onyx a {telegram_id}.")
+                return
+
         invite_link, invite_name, expires_at = await create_manual_open_invite_link(
             message.bot,
             parse_stored_chat_id(telegram_chat_id),
