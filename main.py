@@ -2426,32 +2426,49 @@ def save_user_channel_access(
     invite_link_name: str,
     expires_at: str | None = None,
 ) -> None:
+    # Column names here must match user_channel_access's real schema (id,
+    # telegram_id, channel_code, status, invite_link, invite_link_name,
+    # invite_link_created_at, invite_link_expires_at, invite_link_revoked,
+    # invite_link_used, invite_link_revoked_at, membership_start_date,
+    # expiry_date, joined_channel_at, left_channel_at, removed_at,
+    # removal_reason, notes, created_at, updated_at) — this previously wrote
+    # "channel_key"/"channel_label"/"chat_id"/"access_status"/"granted_at"/
+    # "expires_at", none of which exist on this table, so every call here
+    # silently failed (caught below) since the table was created. Discovered
+    # investigating why a channel's migration found zero tracked members
+    # despite real approved purchases for it.
     payload = {
         "telegram_id": telegram_id,
-        "channel_key": channel_code(channel),
-        "channel_label": channel_label(channel),
-        "chat_id": str(channel_telegram_chat_id(channel)),
+        "channel_code": channel_code(channel),
         "invite_link": invite_link,
         "invite_link_name": invite_link_name,
         "invite_link_created_at": now_utc_iso(),
         "invite_link_revoked": False,
         "invite_link_used": False,
         "status": "active",
-        "access_status": "active",
-        "granted_at": now_utc_iso(),
         "joined_channel_at": now_utc_iso(),
-        "expires_at": expires_at,
+        "expiry_date": expires_at,
         "updated_at": now_utc_iso(),
     }
     try:
-        (
+        # Manual select-then-update-or-insert instead of upsert(on_conflict=...)
+        # — that requires a matching named unique constraint, which given the
+        # history here isn't something to assume exists without checking.
+        existing = (
             supabase.table("user_channel_access")
-            .upsert(payload, on_conflict="telegram_id,channel_key")
+            .select("id")
+            .eq("telegram_id", telegram_id)
+            .eq("channel_code", channel_code(channel))
+            .maybe_single()
             .execute()
         )
+        if existing.data:
+            supabase.table("user_channel_access").update(payload).eq("id", existing.data["id"]).execute()
+        else:
+            supabase.table("user_channel_access").insert(payload).execute()
     except Exception:
         logger.warning(
-            "Could not save user_channel_access telegram_id=%s channel_key=%s",
+            "Could not save user_channel_access telegram_id=%s channel_code=%s",
             telegram_id,
             channel_code(channel),
             exc_info=True,
@@ -2464,14 +2481,14 @@ def get_user_channel_access(supabase: Client, telegram_id: int, channel_key: str
             supabase.table("user_channel_access")
             .select("*")
             .eq("telegram_id", telegram_id)
-            .eq("channel_key", channel_key)
+            .eq("channel_code", channel_key)
             .maybe_single()
             .execute()
         )
         return response.data
     except Exception:
         logger.warning(
-            "Could not read user_channel_access telegram_id=%s channel_key=%s",
+            "Could not read user_channel_access telegram_id=%s channel_code=%s",
             telegram_id,
             channel_key,
             exc_info=True,
@@ -2479,19 +2496,20 @@ def get_user_channel_access(supabase: Client, telegram_id: int, channel_key: str
         return None
 
 
-def get_user_channel_access_rows_for_channel(supabase: Client, channel_key: str) -> list[dict[str, Any]]:
+def get_user_channel_access_rows_for_channel(supabase: Client, channel: dict[str, Any]) -> list[dict[str, Any]]:
+    channel_key = channel_code(channel)
     rows: list[dict[str, Any]] = []
     try:
         response = (
             supabase.table("user_channel_access")
             .select("telegram_id")
-            .eq("channel_key", channel_key)
+            .eq("channel_code", channel_key)
             .execute()
         )
         rows.extend(response.data or [])
     except Exception:
         logger.warning(
-            "Could not list user_channel_access rows for channel_key=%s", channel_key, exc_info=True
+            "Could not list user_channel_access rows for channel_code=%s", channel_key, exc_info=True
         )
 
     # Channels promoted with /manual_open_link (one open, shareable invite
@@ -2500,8 +2518,8 @@ def get_user_channel_access_rows_for_channel(supabase: Client, channel_key: str)
     # used. Merging both sources here means /migrar_canal and /barrer_canal
     # find these people too, instead of reporting an empty list for a
     # channel that may well have real members (see manual_invite_links).
-    # Callers already dedupe telegram_ids via a set, so overlap between the
-    # two sources is harmless.
+    # Callers already dedupe telegram_ids via a set, so overlap between
+    # sources is harmless.
     try:
         manual_response = (
             supabase.table("manual_invite_links")
@@ -2516,7 +2534,35 @@ def get_user_channel_access_rows_for_channel(supabase: Client, channel_key: str)
         )
     except Exception:
         logger.warning(
-            "Could not list manual_invite_links rows for channel_key=%s", channel_key, exc_info=True
+            "Could not list manual_invite_links rows for channel_code=%s", channel_key, exc_info=True
+        )
+
+    # Third source, for approvals made before the user_channel_access bug
+    # above was fixed (or any future case it somehow misses): approve_payment
+    # has always recorded a per-user invite line in payment_history as
+    # "<label>: <link>", regardless of whether user_channel_access itself got
+    # written correctly. A plain substring match on the label is the best
+    # available signal here — payment_history stores this as flattened text,
+    # not a structured per-channel row, so this is best-effort (misses a
+    # channel whose label was renamed since the approval, and could in theory
+    # false-match a differently-named channel whose label is a substring of
+    # this one's) rather than authoritative.
+    try:
+        label = channel_label(channel)
+        history_response = (
+            supabase.table("payment_history")
+            .select("telegram_id")
+            .ilike("invite_link", f"%{label}:%")
+            .execute()
+        )
+        rows.extend(
+            {"telegram_id": row["telegram_id"]}
+            for row in (history_response.data or [])
+            if row.get("telegram_id") is not None
+        )
+    except Exception:
+        logger.warning(
+            "Could not search payment_history for channel_code=%s", channel_key, exc_info=True
         )
 
     return rows
@@ -5000,7 +5046,7 @@ async def run_migrate_channel(
         return
     chat_id = parse_stored_chat_id(telegram_chat_id)
 
-    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, requested_code)
+    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, channel)
     telegram_ids = sorted({int(row["telegram_id"]) for row in rows if row.get("telegram_id") is not None})
     if not telegram_ids:
         await notify(f"No hay usuarios registrados en user_channel_access para el canal {requested_code}.")
@@ -5110,7 +5156,7 @@ async def run_sweep_channel(
         return
     chat_id = parse_stored_chat_id(telegram_chat_id)
 
-    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, requested_code)
+    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, channel)
     telegram_ids = sorted({int(row["telegram_id"]) for row in rows if row.get("telegram_id") is not None})
     if not telegram_ids:
         await notify(f"No hay usuarios registrados en user_channel_access para el canal {requested_code}.")
@@ -6985,7 +7031,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
                         supabase.table("user_channel_access")
                         .update({"invite_link_revoked": True, "updated_at": now_utc_iso()})
                         .eq("telegram_id", telegram_id)
-                        .eq("channel_key", code)
+                        .eq("channel_code", code)
                         .execute()
                     )
                 except Exception:
