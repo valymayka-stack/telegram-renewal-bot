@@ -2480,6 +2480,7 @@ def get_user_channel_access(supabase: Client, telegram_id: int, channel_key: str
 
 
 def get_user_channel_access_rows_for_channel(supabase: Client, channel_key: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     try:
         response = (
             supabase.table("user_channel_access")
@@ -2487,12 +2488,38 @@ def get_user_channel_access_rows_for_channel(supabase: Client, channel_key: str)
             .eq("channel_key", channel_key)
             .execute()
         )
-        return response.data or []
+        rows.extend(response.data or [])
     except Exception:
         logger.warning(
             "Could not list user_channel_access rows for channel_key=%s", channel_key, exc_info=True
         )
-        return []
+
+    # Channels promoted with /manual_open_link (one open, shareable invite
+    # rather than a per-user approval) never write to user_channel_access at
+    # all — the only record of who actually joined is which manual link they
+    # used. Merging both sources here means /migrar_canal and /barrer_canal
+    # find these people too, instead of reporting an empty list for a
+    # channel that may well have real members (see manual_invite_links).
+    # Callers already dedupe telegram_ids via a set, so overlap between the
+    # two sources is harmless.
+    try:
+        manual_response = (
+            supabase.table("manual_invite_links")
+            .select("used_by_telegram_id")
+            .eq("channel_code", channel_key)
+            .execute()
+        )
+        rows.extend(
+            {"telegram_id": row["used_by_telegram_id"]}
+            for row in (manual_response.data or [])
+            if row.get("used_by_telegram_id") is not None
+        )
+    except Exception:
+        logger.warning(
+            "Could not list manual_invite_links rows for channel_key=%s", channel_key, exc_info=True
+        )
+
+    return rows
 
 
 async def revoke_invite_for_user(
