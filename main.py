@@ -2454,16 +2454,21 @@ def save_user_channel_access(
         # Manual select-then-update-or-insert instead of upsert(on_conflict=...)
         # — that requires a matching named unique constraint, which given the
         # history here isn't something to assume exists without checking.
+        # Deliberately not .maybe_single() — in this supabase-py version that
+        # returns None (not a response with .data = None) on zero matches,
+        # which raised AttributeError on every first-ever save for a
+        # (telegram_id, channel_code) pair and silently skipped both the
+        # insert and the update, caught by the except below. Plain .select()
+        # always returns a list, empty or not, so it can't hit that.
         existing = (
             supabase.table("user_channel_access")
             .select("id")
             .eq("telegram_id", telegram_id)
             .eq("channel_code", channel_code(channel))
-            .maybe_single()
             .execute()
         )
         if existing.data:
-            supabase.table("user_channel_access").update(payload).eq("id", existing.data["id"]).execute()
+            supabase.table("user_channel_access").update(payload).eq("id", existing.data[0]["id"]).execute()
         else:
             supabase.table("user_channel_access").insert(payload).execute()
     except Exception:
@@ -2477,15 +2482,15 @@ def save_user_channel_access(
 
 def get_user_channel_access(supabase: Client, telegram_id: int, channel_key: str) -> dict[str, Any] | None:
     try:
+        # Not .maybe_single() — see save_user_channel_access for why.
         response = (
             supabase.table("user_channel_access")
             .select("*")
             .eq("telegram_id", telegram_id)
             .eq("channel_code", channel_key)
-            .maybe_single()
             .execute()
         )
-        return response.data
+        return response.data[0] if response.data else None
     except Exception:
         logger.warning(
             "Could not read user_channel_access telegram_id=%s channel_code=%s",
