@@ -5424,6 +5424,118 @@ async def run_force_cutover_channel(
     await notify(summary)
 
 
+# Android cutover (2026-08) — the mirror-image case run_force_cutover_channel
+# deliberately leaves alone: once an Android fan has logged into Onyx, the
+# in-app feed is how they see this collection going forward, no Telegram
+# channel needed at all (unlike iPhone, which still gets a fresh one-time
+# Telegram invite each visit). Removes anyone tracked for this channel who
+# has logged in with a device_type starting "android" (covers both
+# android_app and someone who only got as far as android_browser) — leaves
+# alone anyone who hasn't logged in yet (that's what run_force_cutover_channel
+# is for) and anyone on iphone/other_mobile/desktop.
+async def run_remove_android_channel(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    requested_code: str,
+    confirm: bool,
+    notify: Callable[[str], Awaitable[None]],
+) -> None:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        await notify("El bridge de Onyx no está configurado (ONYX_API_URL/ONYX_PROVISION_SECRET).")
+        return
+
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, requested_code)
+    if not channel:
+        available_codes = await asyncio.to_thread(available_access_channel_codes, supabase, settings)
+        await notify(f"Canal no encontrado. Códigos disponibles: {available_codes}")
+        return
+    telegram_chat_id = channel_telegram_chat_id(channel)
+    if not telegram_chat_id:
+        await notify(f"Canal {requested_code} no tiene telegram_chat_id configurado.")
+        return
+    chat_id = parse_stored_chat_id(telegram_chat_id)
+
+    rows = await asyncio.to_thread(get_user_channel_access_rows_for_channel, supabase, channel)
+    telegram_ids = sorted({int(row["telegram_id"]) for row in rows if row.get("telegram_id") is not None})
+    if not telegram_ids:
+        await notify(f"No hay usuarios registrados para el canal {requested_code}.")
+        return
+
+    await notify(
+        f"{'Ejecutando' if confirm else 'Simulando (dry-run)'} corte de Android para {len(telegram_ids)} usuario(s) "
+        f"en {channel_label(channel)} ({requested_code}). Remueve a quien ya inició sesión desde Android (app o "
+        f"navegador). Esto puede tardar varios minutos."
+    )
+
+    left_channel = 0
+    unknown_skipped = 0
+    not_android_or_not_logged_in = 0
+    to_remove: list[int] = []
+
+    for telegram_id in telegram_ids:
+        try:
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
+            if member.status not in ACTIVE_MEMBER_STATUSES:
+                left_channel += 1
+                continue
+        except Exception:
+            left_channel += 1
+            continue
+
+        access_check = await check_onyx_access(settings, telegram_id, [requested_code])
+        if access_check is None:
+            unknown_skipped += 1
+            await asyncio.sleep(1.0)
+            continue
+        if requested_code in access_check.get("unknownCodes", []):
+            await notify(f"Abortado: el canal '{requested_code}' no está vinculado a ninguna colección en Onyx.")
+            return
+        device_type = access_check.get("deviceType") or ""
+        if not access_check.get("loggedIn") or not device_type.startswith("android"):
+            not_android_or_not_logged_in += 1
+            await asyncio.sleep(1.0)
+            continue
+
+        to_remove.append(telegram_id)
+        await asyncio.sleep(1.0)
+
+    removed = 0
+    revoked_links = 0
+    if confirm:
+        for telegram_id in to_remove:
+            try:
+                await bot.ban_chat_member(chat_id=chat_id, user_id=telegram_id)
+                await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+                removed += 1
+            except Exception:
+                logger.warning(
+                    "Could not remove telegram_id=%s from channel=%s (android cutover)",
+                    telegram_id,
+                    requested_code,
+                    exc_info=True,
+                )
+            await asyncio.sleep(1.0)
+        revoked_links = await revoke_all_tracked_invite_links(bot, supabase, chat_id, requested_code)
+
+    summary = (
+        f"Corte de Android {'ejecutado' if confirm else 'simulado'} para {channel_label(channel)} ({requested_code}).\n"
+        f"Total en la lista: {len(telegram_ids)}\n"
+        f"Ya no estaban en el canal: {left_channel}\n"
+        f"No se pudo verificar (se dejan intactos por seguridad): {unknown_skipped}\n"
+        f"No son Android o no han iniciado sesión (se quedan): {not_android_or_not_logged_in}\n"
+    )
+    if confirm:
+        summary += f"Removidos del canal: {removed}\n"
+        summary += f"Links de invitación revocados: {revoked_links}\n"
+    else:
+        summary += (
+            f"Serían removidos si confirmas: {len(to_remove)}\n\n"
+            f"Para ejecutar de verdad: /remover_android_canal {requested_code} confirmar"
+        )
+    await notify(summary)
+
+
 @router.message(Command("migrar_canal"))
 async def migrar_canal_command(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
@@ -5475,6 +5587,24 @@ async def forzar_corte_canal_command(message: Message, settings: Settings, supab
         await send_long_message(message, text)
 
     await run_force_cutover_channel(message.bot, supabase, settings, requested_code, confirm, notify)
+
+
+@router.message(Command("remover_android_canal"))
+async def remover_android_canal_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Uso: /remover_android_canal <channel_key> [confirmar]")
+        return
+    requested_code = parts[1].strip()
+    confirm = len(parts) == 3 and parts[2].strip().lower() == "confirmar"
+
+    async def notify(text: str) -> None:
+        await send_long_message(message, text)
+
+    await run_remove_android_channel(message.bot, supabase, settings, requested_code, confirm, notify)
 
 
 @router.message(Command("ask_channel"))
@@ -7867,6 +7997,32 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         return channels_redirect(
             message=(
                 f"Corte definitivo {'de verdad' if is_confirm else '(dry-run)'} de '{channel_key}' iniciado en "
+                "segundo plano — el resumen llega al chat de administración."
+            )
+        )
+
+    @app.post("/dashboard/channels/{channel_key}/remove-android", response_model=None)
+    async def dashboard_remove_android_channel(
+        channel_key: str,
+        request: Request,
+        confirm: str | None = Form(None),
+    ):
+        if not is_logged_in(request):
+            return RedirectResponse(url="/login", status_code=303)
+        is_confirm = confirm == "yes"
+
+        async def notify_admin(text: str) -> None:
+            try:
+                await bot.send_message(settings.admin_chat_id, text)
+            except Exception:
+                logger.warning("Could not notify admin_chat_id with android-cutover update", exc_info=True)
+
+        spawn_background(
+            run_remove_android_channel(bot, supabase, settings, channel_key, is_confirm, notify_admin)
+        )
+        return channels_redirect(
+            message=(
+                f"Corte de Android {'de verdad' if is_confirm else '(dry-run)'} de '{channel_key}' iniciado en "
                 "segundo plano — el resumen llega al chat de administración."
             )
         )

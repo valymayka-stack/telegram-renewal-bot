@@ -139,6 +139,7 @@
                 <th>Migrar</th>
                 <th>Barrer</th>
                 <th>Corte definitivo</th>
+                <th>Corte Android</th>
               </tr>
             </thead>
             <tbody>
@@ -164,6 +165,13 @@
                           onsubmit="return confirm(this.confirm.checked ? '¿Remover YA de Telegram a todos los que NO han iniciado sesión en Onyx en {{ ch.label }}?' : 'Simular corte definitivo (dry-run) de {{ ch.label }}?');">
                       <label><input type="checkbox" name="confirm" value="yes"> confirmar</label>
                       <button class="button danger" type="submit">Forzar corte</button>
+                    </form>
+                  </td>
+                  <td>
+                    <form class="sweep-form" method="post" action="/dashboard/channels/{{ ch.code }}/remove-android"
+                          onsubmit="return confirm(this.confirm.checked ? '¿Remover YA de Telegram a todos los que ya iniciaron sesión desde Android en {{ ch.label }}?' : 'Simular corte de Android (dry-run) de {{ ch.label }}?');">
+                      <label><input type="checkbox" name="confirm" value="yes"> confirmar</label>
+                      <button class="button danger" type="submit">Corte Android</button>
                     </form>
                   </td>
                 </tr>
