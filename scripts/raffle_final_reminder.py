@@ -12,7 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent
-BOT_TOKEN = "8914862269:AAH9CABVEHO7nni9UalM6b3J5MSs7YyzZU0"
+BOT_TOKEN = ""
 
 CART_PAYMENT_INFO = (
     "💳 Cuenta CLABE (BBVA)\n"
@@ -54,9 +54,11 @@ def tg_api(method: str, params: dict):
 
 
 def main() -> None:
+    global BOT_TOKEN
     env = load_env()
     base_url = env["SUPABASE_URL"]
     key = env["SUPABASE_SERVICE_ROLE_KEY"]
+    BOT_TOKEN = env["BOT_TOKEN"]
 
     raffles = sb_get(base_url, key, "raffle_events?select=*&status=eq.active")
     if not raffles:

@@ -24,7 +24,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 REPO_DIR = Path(__file__).resolve().parent.parent
-BOT_TOKEN = "8914862269:AAH9CABVEHO7nni9UalM6b3J5MSs7YyzZU0"
 CONTENT_CHANNEL_ID = -1003915464312
 ADMIN_ID = 7872669612
 APP_TZ = ZoneInfo("America/Mexico_City")
@@ -58,6 +57,7 @@ def load_env() -> dict[str, str]:
 ENV = load_env()
 SUPABASE_URL = ENV["SUPABASE_URL"]
 SUPABASE_KEY = ENV["SUPABASE_SERVICE_ROLE_KEY"]
+BOT_TOKEN = ENV["BOT_TOKEN"]
 
 
 def sb_get(path: str):
