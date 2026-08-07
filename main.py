@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
@@ -5294,12 +5294,32 @@ async def run_migrate_channel(
     aborted = False
 
     for i, telegram_id in enumerate(telegram_ids):
+        # No throttling existed here before — 1000+ get_chat_member calls in
+        # a tight loop can trip Telegram's rate limit, and every failure
+        # (rate limit, network blip, or a genuine ex-member) was silently
+        # counted as "left the channel" with zero logging, making the two
+        # indistinguishable after the fact. A small fixed delay plus an
+        # explicit TelegramRetryAfter retry means a burst of real "left
+        # channel" results in the final summary can now be trusted as real.
+        await asyncio.sleep(0.2)
         try:
             member = await bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
-            if member.status not in ACTIVE_MEMBER_STATUSES:
+        except TelegramRetryAfter as e:
+            logger.warning(
+                "Rate limited on get_chat_member, waiting %ss telegram_id=%s", e.retry_after, telegram_id
+            )
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                member = await bot.get_chat_member(chat_id=chat_id, user_id=telegram_id)
+            except Exception:
+                logger.warning("get_chat_member failed after retry telegram_id=%s", telegram_id, exc_info=True)
                 left_channel += 1
                 continue
         except Exception:
+            logger.warning("get_chat_member failed telegram_id=%s", telegram_id, exc_info=True)
+            left_channel += 1
+            continue
+        if member.status not in ACTIVE_MEMBER_STATUSES:
             left_channel += 1
             continue
 
