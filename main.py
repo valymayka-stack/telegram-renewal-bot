@@ -7204,6 +7204,15 @@ async def track_channel_membership(update: ChatMemberUpdated, bot: Bot, settings
         )
         invite_link_value = update.invite_link.invite_link if update.invite_link else None
         if invite_link_value:
+            try:
+                await bot.revoke_chat_invite_link(chat_id=update.chat.id, invite_link=invite_link_value)
+            except Exception:
+                logger.warning(
+                    "Could not revoke invite link right after use telegram_id=%s channel=%s",
+                    user.id,
+                    update.chat.id,
+                    exc_info=True,
+                )
             manual_link = await asyncio.to_thread(get_manual_invite_by_link, supabase, invite_link_value)
             if manual_link:
                 await asyncio.to_thread(mark_manual_invite_used, supabase, invite_link_value, user.id)
