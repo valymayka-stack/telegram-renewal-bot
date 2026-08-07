@@ -2877,6 +2877,63 @@ async def report_credential_delivery(
         )
 
 
+# Backs /reset_password. A fan's original password is never recoverable —
+# Onyx only ever stores it hashed, same as any auth system — so "olvidé mi
+# contraseña" only has one real fix: generate a new one, set it on the Onyx
+# side, and DM it over. Mirrors notify_onyx_provision's password-generation
+# style (secrets.token_urlsafe(12)) and reuses the same credential-delivery
+# reporting endpoint so this shows up on the admin's Onyx user page exactly
+# like any other credentials DM.
+async def reset_onyx_password(
+    bot: Bot, settings: Settings, telegram_id: int
+) -> tuple[bool, str]:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return False, "El puente con Onyx no está configurado (ONYX_API_URL/ONYX_PROVISION_SECRET)."
+
+    new_password = secrets.token_urlsafe(12)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{settings.onyx_api_url}/api/bot/reset-fan-password",
+                json={"telegramId": str(telegram_id), "password": new_password},
+                headers={"x-bot-secret": settings.onyx_provision_secret},
+            )
+    except Exception:
+        logger.exception("Onyx reset-fan-password request failed telegram_id=%s", telegram_id)
+        return False, "No pude contactar a Onyx para resetear la contraseña."
+
+    if response.status_code == 404:
+        return False, f"Ese telegram_id no tiene ninguna cuenta de Onyx todavía."
+    if response.status_code != 200:
+        logger.warning(
+            "Onyx reset-fan-password rejected telegram_id=%s status=%s body=%s",
+            telegram_id, response.status_code, response.text,
+        )
+        return False, f"Onyx rechazó el reseteo (status {response.status_code})."
+
+    email = response.json().get("email", f"{telegram_id}@onyx.com")
+    text = (
+        "Restablecimos tu contraseña de Onyx porque no la encontrabas.\n\n"
+        f"Accede en {settings.onyx_api_url} — usuario: {email} · contraseña: {new_password}\n\n"
+        "Te recomendamos anotarla en un lugar seguro esta vez."
+    )
+    try:
+        await bot.send_message(telegram_id, text)
+        delivery_status = "sent"
+    except Exception:
+        logger.warning("Could not DM new password telegram_id=%s", telegram_id, exc_info=True)
+        delivery_status = "blocked"
+
+    await report_credential_delivery(settings, telegram_id, "", delivery_status)
+
+    if delivery_status == "blocked":
+        return False, (
+            f"Se reseteó la contraseña de {email}, pero no pude enviarle el DM "
+            "(el bot está bloqueado o el usuario nunca inició el bot)."
+        )
+    return True, f"Contraseña reseteada y enviada por Telegram a {email}."
+
+
 async def approve_payment(
     bot: Bot,
     supabase: Client,
@@ -5605,6 +5662,20 @@ async def remover_android_canal_command(message: Message, settings: Settings, su
         await send_long_message(message, text)
 
     await run_remove_android_channel(message.bot, supabase, settings, requested_code, confirm, notify)
+
+
+@router.message(Command("reset_password"))
+async def reset_password_command(message: Message, settings: Settings) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    telegram_id = command_telegram_id(message)
+    if telegram_id is None:
+        await message.answer("Uso: /reset_password <telegram_id>")
+        return
+
+    ok, text = await reset_onyx_password(message.bot, settings, telegram_id)
+    await message.answer(("✅ " if ok else "⚠️ ") + text)
 
 
 @router.message(Command("ask_channel"))
