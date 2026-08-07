@@ -3536,6 +3536,60 @@ async def remove_user_from_channel(
 ACTIVE_MEMBER_STATUSES = {"member", "administrator", "creator", "restricted"}
 
 
+# Tells the admin in the bot's own chat whenever a fan account gets
+# suspended in Onyx — manual (the "Suspender" button on /admin/users) or
+# automatic (client-side anti-piracy triggers), both end up POSTing here via
+# /onyx/ban (see applyBan()/notifyBotOfBan() and lib/admin/banFan.ts in the
+# Onyx repo). Tries a live get_chat() first for the current username/name
+# (works as long as the user has ever started this bot); falls back to
+# telegram_users if that fails (blocked the bot, chat not cached, etc.).
+# Best-effort like every other bot->admin notification here: a DM failure
+# must never break the ban itself, which has already happened by the time
+# this runs.
+async def notify_admin_of_onyx_ban(
+    bot: Bot, supabase: Client, settings: Settings, telegram_id: int, reason: str
+) -> None:
+    username: str | None = None
+    full_name: str | None = None
+
+    try:
+        chat = await bot.get_chat(telegram_id)
+        username = chat.username
+        full_name = " ".join(part for part in [chat.first_name, chat.last_name] if part) or None
+    except Exception:
+        pass
+
+    if username is None and full_name is None:
+        try:
+            response = await asyncio.to_thread(
+                lambda: supabase.table("telegram_users")
+                .select("username, first_name, last_name")
+                .eq("telegram_id", telegram_id)
+                .maybe_single()
+                .execute()
+            )
+            row = response.data if response else None
+        except Exception:
+            row = None
+        if row:
+            username = row.get("username")
+            full_name = " ".join(part for part in [row.get("first_name"), row.get("last_name")] if part) or None
+
+    handle = f"@{username}" if username else "(sin username)"
+    name_part = f" — {full_name}" if full_name else ""
+
+    text = (
+        "🚫 Cuenta suspendida en Onyx\n\n"
+        f"Telegram ID: {telegram_id}\n"
+        f"Usuario: {handle}{name_part}\n"
+        f"Motivo: {reason}"
+    )
+    try:
+        await bot.send_message(settings.admin_chat_id, text)
+    except Exception:
+        logger.warning("Could not DM admin about Onyx ban telegram_id=%s", telegram_id, exc_info=True)
+
+
 async def sweep_blacklisted_user_from_all_channels(
     bot: Bot, supabase: Client, settings: Settings, telegram_id: int
 ) -> list[str]:
@@ -7704,6 +7758,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         logger.info(
             "Onyx ban propagated telegram_id=%s reason=%s removed_from=%s", telegram_id, reason, removed_from
         )
+        await notify_admin_of_onyx_ban(bot, supabase, settings, telegram_id, reason)
         return {"ok": True, "removedFrom": removed_from}
 
     @app.get("/", response_class=HTMLResponse, response_model=None)
