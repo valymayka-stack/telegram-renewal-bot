@@ -1981,6 +1981,13 @@ async def deliver_raffle_grupo_prize(
     main_invite_name = ""
     for channel in prize_channels:
         code = channel_code(channel)
+        access_note = await onyx_access_note(settings, telegram_id, code)
+        if access_note is not None:
+            channel_links.append({"label": channel_label(channel), "invite_link": access_note})
+            await asyncio.to_thread(
+                save_user_channel_access, supabase, telegram_id, channel, "", "onyx-raffle-prize", None
+            )
+            continue
         chat_id = parse_stored_chat_id(channel_telegram_chat_id(channel))
         invite_link, invite_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, code)
         await asyncio.to_thread(
@@ -2035,6 +2042,18 @@ async def deliver_raffle_set_prize(
     channel = next((c for c in channels if channel_code(c) == prize_channel_code), None)
     if not channel:
         raise ValueError(f"Canal premio no encontrado: {prize_channel_code}")
+
+    access_note = await onyx_access_note(settings, telegram_id, prize_channel_code)
+    if access_note is not None:
+        await asyncio.to_thread(
+            save_user_channel_access, supabase, telegram_id, channel, "", "onyx-raffle-prize", None
+        )
+        await bot.send_message(
+            telegram_id,
+            f"🎁 ¡Felicidades, ganaste el sorteo! Tu premio {channel_label(channel)}:\n{access_note}",
+        )
+        return f"Set {channel_label(channel)} entregado vía Onyx"
+
     chat_id = parse_stored_chat_id(channel_telegram_chat_id(channel))
     invite_link, invite_name = await create_one_use_invite_link_for_chat(bot, chat_id, telegram_id, prize_channel_code)
     await asyncio.to_thread(save_user_channel_access, supabase, telegram_id, channel, invite_link, invite_name, None)
@@ -2816,6 +2835,32 @@ async def notify_onyx_provision(
     return data
 
 
+# Shared by every delivery path that isn't the main approve_payment loop
+# (raffle/prediction-game prizes, manual admin channel picks) — same
+# Onyx-first preference: if this channel has an Onyx collection, provision
+# it and hand back a ready-to-send access note; the caller folds that into
+# whatever confirmation message it already composes, instead of generating
+# a Telegram invite link. Returns None when Onyx provisioning is off or this
+# channel_code has no matching Onyx collection (fails closed on Onyx's side,
+# see provisionOrGrantFan.ts) — the caller should fall back to its existing
+# Telegram invite-link path in that case, unchanged.
+async def onyx_access_note(settings: Settings, telegram_id: int, code: str) -> str | None:
+    if not settings.onyx_provisioning_enabled:
+        return None
+    onyx_result = await notify_onyx_provision(settings, telegram_id, code)
+    if onyx_result is None:
+        return None
+    if onyx_result.get("isNewAccount"):
+        return (
+            f"Accede en {settings.onyx_api_url} — usuario: {onyx_result['email']} · "
+            f"contraseña: {onyx_result['password']}"
+        )
+    return (
+        f"Se agregó a tu cuenta de Onyx ({settings.onyx_api_url}) — "
+        f"usa tu mismo usuario y contraseña de siempre."
+    )
+
+
 # Read-only counterpart to notify_onyx_provision — never creates an account
 # or grants anything, just reports what already exists. Used by the channel
 # migration/sweep commands: migration treats a failed/unknown check as "go
@@ -3084,31 +3129,24 @@ async def approve_payment(
             continue
         # Onyx bridge (2026-08) — off by default (ONYX_PROVISIONING_ENABLED
         # unset). watermark_delivery channels never reach this line (the
-        # `continue` above). Grupo is explicitly excluded here too — it's
-        # documented as staying entirely on Telegram, no Onyx collection
-        # ever exists for it, so attempting this for Grupo always failed
-        # 404 downstream while still leaving an orphaned, credential-less
-        # Onyx account behind as a side effect (fixed in
-        # provisionOrGrantFan.ts too, but excluding it here means the bug
-        # can't recur even if that ordering ever regresses). Anything else
-        # falls straight through to the exact invite-link code that already
-        # runs today, unchanged.
-        if settings.onyx_provisioning_enabled and code != GRUPO_CHANNEL_KEY:
-            onyx_result = await notify_onyx_provision(settings, telegram_id, code)
-            if onyx_result is not None:
-                if onyx_result.get("isNewAccount"):
-                    access_note = (
-                        f"Accede en {settings.onyx_api_url} — usuario: {onyx_result['email']} · "
-                        f"contraseña: {onyx_result['password']}"
-                    )
-                else:
-                    access_note = (
-                        f"Se agregó a tu cuenta de Onyx ({settings.onyx_api_url}) — "
-                        f"usa tu mismo usuario y contraseña de siempre."
-                    )
-                channel_links.append({"label": channel_label(channel), "invite_link": access_note})
-                onyx_channel_codes.append(code)
-                continue
+        # `continue` above). Grupo used to be excluded here (it never had an
+        # Onyx collection) — it does now (as "Exclusive Chivis"), so this
+        # applies uniformly to every channel; onyx_access_note itself
+        # fails closed (returns None) for any channel_code Onyx doesn't
+        # recognize, so nothing here needs to special-case which ones do.
+        access_note = await onyx_access_note(settings, telegram_id, code)
+        if access_note is not None:
+            channel_links.append({"label": channel_label(channel), "invite_link": access_note})
+            onyx_channel_codes.append(code)
+            # /migrar_canal and /barrer_canal only ever see a telegram_id for
+            # this channel if it's recorded somewhere (same reasoning as
+            # send_manual_link's onyx branch) — without this, an
+            # Onyx-delivered purchase would be invisible to a future sweep,
+            # indistinguishable from someone who was never tracked at all.
+            await asyncio.to_thread(
+                save_user_channel_access, supabase, telegram_id, channel, "", "onyx-purchase", None
+            )
+            continue
         telegram_chat_id = channel_telegram_chat_id(channel)
         if not telegram_chat_id:
             logger.error("Selected approval channel is missing telegram_chat_id: %s", channel)
@@ -4250,6 +4288,17 @@ async def send_raffle_winner_link(message: Message, settings: Settings, supabase
         return
     telegram_id = int(raffle["winner_telegram_id"])
     try:
+        access_note = await onyx_access_note(settings, telegram_id, channel_code(channel))
+        if access_note is not None:
+            await asyncio.to_thread(
+                save_user_channel_access, supabase, telegram_id, channel, "", "onyx-raffle-prize", None
+            )
+            await message.bot.send_message(
+                telegram_id,
+                f"🎉 Felicidades, ganaste el sorteo.\n\nTu premio:\n{access_note}",
+            )
+            await message.answer(f"Prize delivered via Onyx to raffle winner {telegram_id}.")
+            return
         invite_link, invite_name = await create_one_use_invite_link_for_chat(
             message.bot,
             parse_stored_chat_id(channel_telegram_chat_id(channel)),
@@ -5079,10 +5128,9 @@ async def send_manual_link(message: Message, settings: Settings, supabase: Clien
         # in their feed already logged in; iPhone: they get a one-time
         # Telegram invite the next time they visit Onyx, not from this
         # command directly). Falls back to the plain manual Telegram link
-        # below only when the bridge is off, this channel isn't one Onyx has
-        # a collection for, or it's Grupo — which by design never gets an
-        # Onyx collection, so this deliberately never even attempts it.
-        if settings.onyx_provisioning_enabled and requested_code != GRUPO_CHANNEL_KEY:
+        # below only when the bridge is off or this channel isn't one Onyx
+        # has a collection for — Grupo included, now that it has one.
+        if settings.onyx_provisioning_enabled:
             onyx_result = await notify_onyx_provision(settings, telegram_id, requested_code)
             if onyx_result is not None:
                 if onyx_result.get("isNewAccount"):
@@ -6276,6 +6324,17 @@ async def send_prediction_winners_link(message: Message, settings: Settings, sup
     for row in rows:
         telegram_id = int(row["telegram_id"])
         try:
+            access_note = await onyx_access_note(settings, telegram_id, channel_code(channel))
+            if access_note is not None:
+                await asyncio.to_thread(
+                    save_user_channel_access, supabase, telegram_id, channel, "", "onyx-prediction-prize", None
+                )
+                await message.bot.send_message(
+                    telegram_id,
+                    f"Ganaste el pronóstico 🎉\n\nTu premio:\n{access_note}",
+                )
+                sent += 1
+                continue
             invite_link, _invite_name = await create_one_use_invite_link_for_chat(
                 message.bot,
                 chat_id,
@@ -6460,6 +6519,30 @@ async def send_selected_channel_link(callback_query: CallbackQuery, settings: Se
 
     label = channel_label(channel)
     code = channel_code(channel)
+
+    access_note = await onyx_access_note(settings, telegram_id, code)
+    if access_note is not None:
+        try:
+            await callback_query.bot.send_message(
+                telegram_id,
+                f"Tu acceso a {label}:\n{access_note}",
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            logger.warning("Could not DM selected channel Onyx note telegram_id=%s", telegram_id, exc_info=True)
+            if callback_query.message:
+                await callback_query.message.edit_text(
+                    "No pude enviar el link. El usuario debe abrir el bot o escribirle primero."
+                )
+            await callback_query.answer("No pude enviar el link.", show_alert=True)
+            return
+        await asyncio.to_thread(
+            save_user_channel_access, supabase, telegram_id, channel, "", "onyx-manual-select", None
+        )
+        if callback_query.message:
+            await callback_query.message.edit_text(f"Entregado vía Onyx a {telegram_id}: {label}")
+        await callback_query.answer("Enviado ✅")
+        return
+
     try:
         invite_link, invite_name = await create_one_use_invite_link_for_chat(
             callback_query.bot,
