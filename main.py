@@ -2934,6 +2934,80 @@ async def reset_onyx_password(
     return True, f"Contraseña reseteada y enviada por Telegram a {email}."
 
 
+# Backs the daily expiry sweep for has_expiry channels linked to an Onyx
+# collection (e.g. "Exclusive Chivis") — same outbound bot->Onyx pattern as
+# notify_onyx_provision/reset_onyx_password (httpx.AsyncClient, x-bot-secret
+# header, never raises). The bot doesn't need to know which channel_codes are
+# actually Onyx-linked: Onyx's /api/bot/expire-fan-collection route already
+# fails closed (404, no side effects) for any channelCode without a matching
+# collection, so this can be called unconditionally for every expired row.
+async def notify_onyx_expiry(settings: Settings, telegram_id: int, channel_code_value: str) -> bool:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{settings.onyx_api_url}/api/bot/expire-fan-collection",
+                json={"telegramId": str(telegram_id), "channelCode": channel_code_value},
+                headers={"x-bot-secret": settings.onyx_provision_secret},
+            )
+    except Exception:
+        logger.exception(
+            "Onyx expire-fan-collection request failed telegram_id=%s channel=%s",
+            telegram_id, channel_code_value,
+        )
+        return False
+    if response.status_code not in (200, 404):
+        logger.warning(
+            "Onyx expire-fan-collection rejected telegram_id=%s channel=%s status=%s body=%s",
+            telegram_id, channel_code_value, response.status_code, response.text,
+        )
+    return response.status_code == 200
+
+
+# Nothing today reads user_channel_access.expiry_date back to detect an
+# expired row — it's write-only from that standpoint (confirmed by grepping
+# every read site). This is the first per-channel expiry scan against that
+# table; expired_active_users() (used by the Grupo-only auto-remove flow) is
+# a separate, unrelated query against telegram_users.
+def expired_channel_access_rows(supabase: Client, channel_code: str) -> list[dict[str, Any]]:
+    response = (
+        supabase.table("user_channel_access")
+        .select("telegram_id")
+        .eq("channel_code", channel_code)
+        .lt("expiry_date", today_iso())
+        .execute()
+    )
+    return response.data or []
+
+
+# For every active, has_expiry channel, tells Onyx about anyone whose
+# per-channel access has lapsed. Runs alongside notify_expiring_today (same
+# daily job) but is otherwise independent of it — this only concerns
+# Onyx-linked collections, not the legacy Grupo/telegram_users expiry flow.
+# Idempotent: re-notifying an already-expired row is harmless (Onyx just sets
+# expires_at to "now" again), so no per-row dedup/sent-tracking is needed.
+async def notify_onyx_expired_channel_access(supabase: Client, settings: Settings) -> int:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return 0
+    notified = 0
+    channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+    for channel in channels:
+        if not channel_has_expiry(channel):
+            continue
+        code = channel.get("code")
+        if not code:
+            continue
+        rows = await asyncio.to_thread(expired_channel_access_rows, supabase, code)
+        for row in rows:
+            telegram_id = row.get("telegram_id")
+            if telegram_id is None:
+                continue
+            if await notify_onyx_expiry(settings, int(telegram_id), code):
+                notified += 1
+    return notified
+
+
 async def approve_payment(
     bot: Bot,
     supabase: Client,
@@ -7237,6 +7311,10 @@ async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) 
             sections.append(f"AUTO_REMOVE_EXPIRED=true, removidos: {removed}/{len(expired_rows)}")
         elif expired_rows:
             sections.append("AUTO_REMOVE_EXPIRED=false, no se removió a nadie.")
+
+        onyx_expired_notified = await notify_onyx_expired_channel_access(supabase, settings)
+        if onyx_expired_notified:
+            sections.append(f"Onyx: acceso vencido notificado para {onyx_expired_notified} usuario(s).")
 
         text = "\n".join(sections) if sections else f"Sin avisos de renovación para {today.isoformat()}."
         await bot.send_message(settings.admin_chat_id, text[:3900])
