@@ -2602,6 +2602,28 @@ def get_user_channel_access_rows_for_channel(supabase: Client, channel: dict[str
             "Could not search payment_history for channel_code=%s", channel_key, exc_info=True
         )
 
+    # Fourth source, Grupo-only: telegram_users predates user_channel_access
+    # entirely — it's the original single-channel membership table Grupo has
+    # always used (status/expiry_date/invite_link), and rows there were never
+    # backfilled into user_channel_access when the multi-channel table was
+    # introduced. Every other channel this bot manages started after that
+    # migration, so this table is irrelevant for them — only Grupo has real
+    # members hiding here that the three sources above miss entirely. Pulls
+    # every row regardless of status: run_migrate_channel/run_sweep_channel
+    # already re-verify actual Telegram membership via get_chat_member before
+    # acting on anyone, so an over-inclusive candidate list here is safe —
+    # someone who really left just gets skipped downstream as expected.
+    if channel_key == GRUPO_CHANNEL_KEY:
+        try:
+            legacy_response = supabase.table("telegram_users").select("telegram_id").execute()
+            rows.extend(
+                {"telegram_id": row["telegram_id"]}
+                for row in (legacy_response.data or [])
+                if row.get("telegram_id") is not None
+            )
+        except Exception:
+            logger.warning("Could not list telegram_users rows for legacy Grupo migration", exc_info=True)
+
     return [row for row in rows if row.get("telegram_id") not in EXCLUDED_FROM_ONYX_MIGRATION]
 
 
