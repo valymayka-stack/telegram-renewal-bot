@@ -4531,14 +4531,23 @@ TELEGRAM_BOT_FILE_SIZE_LIMIT = 20 * 1024 * 1024
 # its own independent message.
 @router.channel_post(F.photo | F.video | F.text)
 async def mirror_grupo_post_to_onyx(message: Message, settings: Settings, supabase: Client) -> None:
+    # Any slash-command (e.g. /chat_id, /master <code>) has its own
+    # dedicated handler elsewhere in the file — this must never intercept
+    # those, in Grupo or any other channel the bot administers, or they stop
+    # working there. Checked before anything else, including which channel
+    # this is: a real post never starts with "/".
+    text_content = message.caption or message.text or ""
+    if text_content.startswith("/"):
+        raise SkipHandler()
+
     channel = await asyncio.to_thread(get_access_channel_by_code, supabase, GRUPO_CHANNEL_KEY)
     if not channel:
-        return
+        raise SkipHandler()
     chat_id_raw = channel_telegram_chat_id(channel)
     if not chat_id_raw or message.chat.id != parse_stored_chat_id(chat_id_raw):
-        return
+        raise SkipHandler()
     if not settings.onyx_api_url or not settings.onyx_provision_secret:
-        return
+        raise SkipHandler()
 
     caption = message.caption or message.text or None
 
