@@ -4513,6 +4513,100 @@ async def master_content_capture(message: Message, settings: Settings, supabase:
     await message.answer(f"✅ Foto guardada para '{code}' (van {total} en total)")
 
 
+# Telegram's Bot API caps getFile/download at 20MB regardless of plan — a
+# hard platform limit, not something this bot can raise. A clip over that
+# just can't be mirrored automatically; the admin gets a heads-up instead of
+# it silently never showing up in Onyx.
+TELEGRAM_BOT_FILE_SIZE_LIMIT = 20 * 1024 * 1024
+
+
+# Mirrors a post in the "grupo"/Exclusive Chivis Telegram channel into its
+# matching Onyx collection, so the operator only has to publish once (in
+# Telegram, including via Telegram's own scheduled-message feature — the Bot
+# API only ever tells a bot about a channel_post once it's actually live,
+# never in advance, so this fires at exactly the scheduled time either way).
+# One channel_post = one Onyx post: confirmed with the operator that she
+# always posts a single photo/video/text at a time, never a multi-photo
+# album, so there's no media_group_id batching here — every post arrives as
+# its own independent message.
+@router.channel_post(F.photo | F.video | F.text)
+async def mirror_grupo_post_to_onyx(message: Message, settings: Settings, supabase: Client) -> None:
+    channel = await asyncio.to_thread(get_access_channel_by_code, supabase, GRUPO_CHANNEL_KEY)
+    if not channel:
+        return
+    chat_id_raw = channel_telegram_chat_id(channel)
+    if not chat_id_raw or message.chat.id != parse_stored_chat_id(chat_id_raw):
+        return
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return
+
+    caption = message.caption or message.text or None
+
+    content_type: str
+    file_bytes: bytes | None = None
+    filename: str | None = None
+    mime: str | None = None
+
+    if message.photo:
+        content_type = "image"
+        telegram_file = await message.bot.get_file(message.photo[-1].file_id)
+        buffer = BytesIO()
+        await message.bot.download_file(telegram_file.file_path, destination=buffer)
+        file_bytes = buffer.getvalue()
+        filename = "photo.jpg"
+        mime = "image/jpeg"
+    elif message.video:
+        if (message.video.file_size or 0) > TELEGRAM_BOT_FILE_SIZE_LIMIT:
+            size_mb = round((message.video.file_size or 0) / (1024 * 1024), 1)
+            await message.bot.send_message(
+                settings.admin_chat_id,
+                f"⚠️ No pude reflejar en Onyx un video de Grupo ({size_mb}MB) — Telegram no deja "
+                "que los bots bajen archivos de más de 20MB. Súbelo a mano en /admin/collections.",
+            )
+            return
+        content_type = "video"
+        telegram_file = await message.bot.get_file(message.video.file_id)
+        buffer = BytesIO()
+        await message.bot.download_file(telegram_file.file_path, destination=buffer)
+        file_bytes = buffer.getvalue()
+        filename = "video.mp4"
+        mime = message.video.mime_type or "video/mp4"
+    else:
+        content_type = "text"
+
+    data = {"channelCode": GRUPO_CHANNEL_KEY, "contentType": content_type}
+    if caption:
+        data["caption"] = caption
+    files = {"file": (filename, file_bytes, mime)} if file_bytes is not None else None
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{settings.onyx_api_url}/api/bot/mirror-channel-post",
+                data=data,
+                files=files,
+                headers={"x-bot-secret": settings.onyx_provision_secret},
+            )
+    except Exception:
+        logger.exception("Failed to reach Onyx for mirror-channel-post")
+        await message.bot.send_message(
+            settings.admin_chat_id, "⚠️ No pude reflejar el último post de Grupo en Onyx (sin conexión)."
+        )
+        return
+
+    if response.status_code != 200:
+        logger.warning(
+            "Onyx mirror-channel-post rejected status=%s body=%s", response.status_code, response.text
+        )
+        await message.bot.send_message(
+            settings.admin_chat_id,
+            f"⚠️ Onyx rechazó el espejo del último post de Grupo (status {response.status_code}).",
+        )
+        return
+
+    await message.bot.send_message(settings.admin_chat_id, "✅ Post de Grupo reflejado en Onyx.")
+
+
 @router.message(Command("toggle_watermark"))
 async def toggle_watermark_command(message: Message, settings: Settings, supabase: Client) -> None:
     if not is_admin(message, settings):
