@@ -3672,6 +3672,10 @@ async def revoke_all_invite_links_for_user(
             continue
         try:
             await bot.revoke_chat_invite_link(parse_stored_chat_id(chat_id_raw), link)
+        except TelegramBadRequest:
+            # Already expired/invalid at Telegram's end — the goal (link
+            # unusable) is already true, so still mark it revoked below.
+            pass
         except Exception:
             logger.warning("Could not revoke manual_invite_links id=%s", row.get("id"), exc_info=True)
             continue
@@ -3686,10 +3690,12 @@ async def revoke_all_invite_links_for_user(
             logger.warning("Could not mark manual_invite_links id=%s revoked", row.get("id"), exc_info=True)
         revoked_labels.append(row.get("channel_code") or "manual")
 
+    # user_channel_access has no chat_id column of its own — only
+    # channel_code, so the chat id has to come from access_channels.
     try:
         access_rows = (
             supabase.table("user_channel_access")
-            .select("id, channel_key, chat_id, invite_link")
+            .select("id, channel_code, invite_link")
             .eq("telegram_id", telegram_id)
             .eq("invite_link_revoked", False)
             .execute()
@@ -3698,13 +3704,22 @@ async def revoke_all_invite_links_for_user(
         logger.warning("Could not list user_channel_access for telegram_id=%s", telegram_id, exc_info=True)
         access_rows = None
 
+    channel_chat_id_cache: dict[str, Any] = {}
     for row in (access_rows.data if access_rows else []) or []:
         link = row.get("invite_link")
-        chat_id_raw = row.get("chat_id")
-        if not link or not chat_id_raw:
+        channel_code_val = row.get("channel_code")
+        if not link or not channel_code_val:
+            continue
+        if channel_code_val not in channel_chat_id_cache:
+            channel = await asyncio.to_thread(get_access_channel_by_code, supabase, channel_code_val)
+            channel_chat_id_cache[channel_code_val] = channel_telegram_chat_id(channel) if channel else None
+        chat_id_raw = channel_chat_id_cache[channel_code_val]
+        if not chat_id_raw:
             continue
         try:
             await bot.revoke_chat_invite_link(parse_stored_chat_id(chat_id_raw), link)
+        except TelegramBadRequest:
+            pass
         except Exception:
             logger.warning("Could not revoke user_channel_access id=%s", row.get("id"), exc_info=True)
             continue
@@ -3717,7 +3732,7 @@ async def revoke_all_invite_links_for_user(
             )
         except Exception:
             logger.warning("Could not mark user_channel_access id=%s revoked", row.get("id"), exc_info=True)
-        revoked_labels.append(row.get("channel_key") or "unknown")
+        revoked_labels.append(channel_code_val)
 
     return revoked_labels
 
@@ -5701,12 +5716,12 @@ async def revoke_all_tracked_invite_links(
         rows = (
             supabase.table("user_channel_access")
             .select("id, invite_link")
-            .eq("channel_key", channel_key)
+            .eq("channel_code", channel_key)
             .eq("invite_link_revoked", False)
             .execute()
         )
     except Exception:
-        logger.warning("Could not list invite links to revoke for channel_key=%s", channel_key, exc_info=True)
+        logger.warning("Could not list invite links to revoke for channel_code=%s", channel_key, exc_info=True)
         return 0
 
     revoked = 0
