@@ -122,6 +122,19 @@ RAFFLE_TOP3_PRIZE_LABELS = {
     2: "set Love Seat",
     3: "1 mes de Grupo Exclusivo",
 }
+# Sorteo "TANGUITA USADA" (2026-08) — primer sorteo de 4 lugares. Constantes
+# separadas de RAFFLE_TOP3_* a propósito: el 1er lugar es un premio físico
+# sin entrega automática, y los rangos/canal difieren del sorteo anterior.
+RAFFLE4_SET_PRIZE_CHANNEL_CODE = "lovely"
+RAFFLE4_GRUPO_RANKS = {2, 4}
+RAFFLE4_SET_RANKS = {2, 3}
+RAFFLE4_MANUAL_RANKS = {1}
+RAFFLE4_PRIZE_LABELS = {
+    1: "Tanguita usada a elegir",
+    2: "1 mes de Grupo Exclusivo + set Lovely",
+    3: "Set Lovely",
+    4: "1 mes de Grupo Exclusivo",
+}
 GRUPO_CHANNEL_KEY = "grupo"
 GRUPO_CHANNEL_LABEL = "Grupo"
 LADY_CHANNEL_KEY = "lady_in_red"
@@ -357,6 +370,8 @@ alter table public.raffle_events add column if not exists second_place_ticket te
 alter table public.raffle_events add column if not exists second_place_telegram_id bigint;
 alter table public.raffle_events add column if not exists third_place_ticket text;
 alter table public.raffle_events add column if not exists third_place_telegram_id bigint;
+alter table public.raffle_events add column if not exists fourth_place_ticket text;
+alter table public.raffle_events add column if not exists fourth_place_telegram_id bigint;
 create table if not exists public.cart_reminders (
   telegram_id bigint primary key,
   reminded_at timestamptz default now()
@@ -1939,6 +1954,60 @@ def draw_raffle_winners_top3(supabase: Client, raffle: dict[str, Any]) -> dict[s
     }
 
 
+# Sorteo "TANGUITA USADA" (2026-08) — primer sorteo con 4 lugares. Copia de
+# draw_raffle_winners_top3 extendida a un 4to lugar; no se tocó la original
+# porque cualquier sorteo futuro que solo necesite top-3 debe seguir
+# funcionando exactamente igual que hoy.
+def draw_raffle_winners_top4(supabase: Client, raffle: dict[str, Any]) -> dict[str, Any]:
+    if raffle.get("winner_ticket"):
+        return {
+            "already_drawn": True,
+            "places": [
+                {"rank": 1, "ticket_number": raffle.get("winner_ticket"), "telegram_id": raffle.get("winner_telegram_id")},
+                {"rank": 2, "ticket_number": raffle.get("second_place_ticket"), "telegram_id": raffle.get("second_place_telegram_id")},
+                {"rank": 3, "ticket_number": raffle.get("third_place_ticket"), "telegram_id": raffle.get("third_place_telegram_id")},
+                {"rank": 4, "ticket_number": raffle.get("fourth_place_ticket"), "telegram_id": raffle.get("fourth_place_telegram_id")},
+            ],
+        }
+    tickets = confirmed_raffle_tickets(supabase, int(raffle["id"]))
+    if not tickets:
+        raise ValueError("No confirmed tickets.")
+    count = min(4, len(tickets))
+    pool = list(tickets)
+    winners: list[dict[str, Any]] = []
+    for _ in range(count):
+        winners.append(pool.pop(secrets.randbelow(len(pool))))
+    payload = {
+        "winner_ticket": winners[0]["ticket_number"],
+        "winner_telegram_id": winners[0]["telegram_id"],
+        "winner_drawn_at": now_utc_iso(),
+        "updated_at": now_utc_iso(),
+    }
+    if len(winners) > 1:
+        payload["second_place_ticket"] = winners[1]["ticket_number"]
+        payload["second_place_telegram_id"] = winners[1]["telegram_id"]
+    if len(winners) > 2:
+        payload["third_place_ticket"] = winners[2]["ticket_number"]
+        payload["third_place_telegram_id"] = winners[2]["telegram_id"]
+    if len(winners) > 3:
+        payload["fourth_place_ticket"] = winners[3]["ticket_number"]
+        payload["fourth_place_telegram_id"] = winners[3]["telegram_id"]
+    (
+        supabase.table("raffle_events")
+        .update(payload)
+        .eq("id", raffle["id"])
+        .is_("winner_drawn_at", "null")
+        .execute()
+    )
+    return {
+        "already_drawn": False,
+        "places": [
+            {"rank": i + 1, "ticket_number": w["ticket_number"], "telegram_id": w["telegram_id"]}
+            for i, w in enumerate(winners)
+        ],
+    }
+
+
 def user_has_active_membership(user: dict[str, Any] | None) -> bool:
     if not user or user.get("status") != "active":
         return False
@@ -2064,6 +2133,19 @@ async def deliver_raffle_set_prize(
     return f"Set {channel_label(channel)} entregado"
 
 
+# Sorteo "TANGUITA USADA" (2026-08) — premio físico elegido por la ganadora,
+# sin entrega automática de ningún canal ni paso por Onyx. Solo avisa; la
+# coordinación real la hace la admin directo con la ganadora.
+async def deliver_raffle_manual_prize(bot: Bot, telegram_id: int, label: str) -> str:
+    await bot.send_message(
+        telegram_id,
+        "🎉 ¡Felicidades, ganaste el sorteo! 🎁\n\n"
+        f"Tu premio: {label}\n\n"
+        "Te voy a escribir por aquí directo para que elijas y coordinemos la entrega.",
+    )
+    return f"Aviso enviado — premio manual: {label}"
+
+
 async def announce_and_deliver_raffle_top3(
     bot: Bot,
     supabase: Client,
@@ -2105,6 +2187,65 @@ async def announce_and_deliver_raffle_top3(
             if rank in RAFFLE_TOP3_SET_RANKS:
                 status = await deliver_raffle_set_prize(
                     bot, supabase, settings, telegram_id, RAFFLE_TOP3_SET_PRIZE_CHANNEL_CODE
+                )
+                delivery_log.append(f"Lugar {rank} ({telegram_id}): {status}")
+        except (TelegramBadRequest, TelegramForbiddenError):
+            logger.warning("Could not DM raffle prize rank=%s telegram_id=%s", rank, telegram_id, exc_info=True)
+            delivery_log.append(f"Lugar {rank} ({telegram_id}): no pude enviar DM (bot bloqueado o nunca abrió el bot)")
+        except Exception as exc:
+            logger.exception("Could not deliver raffle prize rank=%s telegram_id=%s", rank, telegram_id)
+            delivery_log.append(f"Lugar {rank} ({telegram_id}): ERROR - {exc}")
+
+    return {"already_drawn": result["already_drawn"], "delivery_log": delivery_log}
+
+
+# Sorteo "TANGUITA USADA" (2026-08) — copia de announce_and_deliver_raffle_top3
+# extendida a 4 lugares, con el 1er lugar como premio manual (sin entrega
+# automática). No se tocó la función original de top-3.
+async def announce_and_deliver_raffle_top4(
+    bot: Bot,
+    supabase: Client,
+    settings: Settings,
+    admin_id: int,
+) -> dict[str, Any]:
+    raffle = await asyncio.to_thread(get_active_raffle, supabase)
+    if not raffle:
+        raise ValueError("No hay ninguna rifa activa.")
+    result = await asyncio.to_thread(draw_raffle_winners_top4, supabase, raffle)
+    places = {p["rank"]: p for p in result["places"] if p.get("ticket_number") is not None}
+    if result["already_drawn"]:
+        return {
+            "already_drawn": True,
+            "delivery_log": ["Ya se había sorteado y entregado antes; no se reenvían premios ni se vuelve a anunciar."],
+        }
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉", 4: "🎗️"}
+    lines = [f"🎉 GANADORES — {raffle.get('title') or 'Sorteo'} 🎉", ""]
+    for rank in (1, 2, 3, 4):
+        place = places.get(rank)
+        if not place:
+            continue
+        lines.append(f"{medals.get(rank, '•')} Boleto {place['ticket_number']} — {RAFFLE4_PRIZE_LABELS.get(rank, '')}")
+    lines.append("")
+    lines.append("📩 Los premios se enviarán por privado a cada ganador. ¡Felicidades! 🎊")
+    await bot.send_message(settings.content_channel_id, "\n".join(lines))
+
+    delivery_log: list[str] = []
+    for rank in (1, 2, 3, 4):
+        place = places.get(rank)
+        if not place or not place.get("telegram_id"):
+            continue
+        telegram_id = int(place["telegram_id"])
+        try:
+            if rank in RAFFLE4_MANUAL_RANKS:
+                status = await deliver_raffle_manual_prize(bot, telegram_id, RAFFLE4_PRIZE_LABELS.get(rank, ""))
+                delivery_log.append(f"Lugar {rank} ({telegram_id}): {status}")
+            if rank in RAFFLE4_GRUPO_RANKS:
+                status = await deliver_raffle_grupo_prize(bot, supabase, settings, telegram_id, admin_id)
+                delivery_log.append(f"Lugar {rank} ({telegram_id}): {status}")
+            if rank in RAFFLE4_SET_RANKS:
+                status = await deliver_raffle_set_prize(
+                    bot, supabase, settings, telegram_id, RAFFLE4_SET_PRIZE_CHANNEL_CODE
                 )
                 delivery_log.append(f"Lugar {rank} ({telegram_id}): {status}")
         except (TelegramBadRequest, TelegramForbiddenError):
@@ -3875,6 +4016,10 @@ def build_category_picker_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Etérea", callback_data="cart:category:eterea"),
                 InlineKeyboardButton(text="Casera", callback_data="cart:category:casera"),
             ],
+            # Reusa el callback "raffle:start" ya existente (raffle_user_callback,
+            # ~línea 6975 en este archivo) — ya maneja el caso de "no hay sorteo
+            # activo", no se agregó ningún handler nuevo para este botón.
+            [InlineKeyboardButton(text="🎟️ SORTEO", callback_data="raffle:start")],
             [InlineKeyboardButton(text="Ver carrito", callback_data="cart:view")],
         ]
     )
@@ -4493,6 +4638,48 @@ async def raffle_announce_winners_command(message: Message, settings: Settings, 
         await send_long_message(message, "\n".join(lines))
     except Exception as exc:
         logger.exception("Could not announce/deliver top-3 raffle winners")
+        await message.answer(f"No pude anunciar/entregar el sorteo: {exc}")
+
+
+# Sorteo "TANGUITA USADA" (2026-08) — equivalentes de 4 lugares a los dos
+# comandos de arriba, sin tocarlos.
+@router.message(Command("raffle_draw_top4"))
+async def raffle_draw_top4_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    raffle = await asyncio.to_thread(get_active_raffle, supabase)
+    if not raffle:
+        await message.answer("No hay ninguna rifa activa.")
+        return
+    try:
+        result = await asyncio.to_thread(draw_raffle_winners_top4, supabase, raffle)
+        medals = {1: "🥇", 2: "🥈", 3: "🥉", 4: "🎗️"}
+        prefix = "Ya se había sorteado" if result["already_drawn"] else "🎉 Sorteo realizado"
+        lines = [prefix + ":"]
+        for place in result["places"]:
+            if place["ticket_number"] is None:
+                continue
+            lines.append(f"{medals.get(place['rank'], '•')} Lugar {place['rank']}: boleto {place['ticket_number']} — telegram_id {place['telegram_id']}")
+        await send_long_message(message, "\n".join(lines))
+    except Exception as exc:
+        logger.exception("Could not draw top-4 raffle winners")
+        await message.answer(f"No pude hacer el sorteo: {exc}")
+
+
+@router.message(Command("raffle_announce_winners_top4"))
+async def raffle_announce_winners_top4_command(message: Message, settings: Settings, supabase: Client) -> None:
+    if not is_admin(message, settings):
+        await reject_non_admin(message)
+        return
+    try:
+        result = await announce_and_deliver_raffle_top4(message.bot, supabase, settings, message.from_user.id)
+        prefix = "Ya se había sorteado y entregado" if result["already_drawn"] else "🎉 Sorteo anunciado y premios entregados"
+        lines = [prefix + ":"]
+        lines.extend(result["delivery_log"] or ["(sin ganadores con boletos confirmados)"])
+        await send_long_message(message, "\n".join(lines))
+    except Exception as exc:
+        logger.exception("Could not announce/deliver top-4 raffle winners")
         await message.answer(f"No pude anunciar/entregar el sorteo: {exc}")
 
 
