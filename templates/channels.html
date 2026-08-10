@@ -118,6 +118,17 @@
         align-items: center;
         gap: 4px;
       }
+      .migrated-badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        border-radius: 6px;
+        border: 1px solid #abd8c5;
+        background: #e8f5f0;
+        color: #0f513f;
+        padding: 0 10px;
+        font-size: 13px;
+      }
     </style>
   </head>
   <body>
@@ -148,10 +159,14 @@
                   <td>{{ ch.label }}</td>
                   <td><code>{{ ch.code }}</code></td>
                   <td>
-                    <form method="post" action="/dashboard/channels/{{ ch.code }}/migrate"
-                          onsubmit="return confirm('¿Migrar a Onyx a todos los usuarios registrados de {{ ch.label }}?');">
-                      <button class="button" type="submit">Migrar a Onyx</button>
-                    </form>
+                    {% if ch.migrated %}
+                      <span class="migrated-badge">Ya migrado</span>
+                    {% else %}
+                      <form method="post" action="/dashboard/channels/{{ ch.code }}/migrate"
+                            onsubmit="return confirm('¿Migrar a Onyx a todos los usuarios registrados de {{ ch.label }}?');">
+                        <button class="button" type="submit">Migrar a Onyx</button>
+                      </form>
+                    {% endif %}
                   </td>
                   <td>
                     <form class="sweep-form" method="post" action="/dashboard/channels/{{ ch.code }}/sweep"

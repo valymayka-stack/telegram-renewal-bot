@@ -8383,14 +8383,18 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             return RedirectResponse(url="/login", status_code=303)
         channels = await asyncio.to_thread(get_access_channels, supabase, settings)
         migrated_codes = await get_migrated_onyx_channel_codes(settings)
-        channels = [c for c in channels if channel_code(c) not in migrated_codes]
         return templates.TemplateResponse(
             request,
             "channels.html",
             {
                 "request": request,
                 "channels": [
-                    {"code": channel_code(c), "label": channel_label(c)} for c in channels
+                    {
+                        "code": channel_code(c),
+                        "label": channel_label(c),
+                        "migrated": channel_code(c) in migrated_codes,
+                    }
+                    for c in channels
                 ],
                 "message": message,
                 "error": error,
