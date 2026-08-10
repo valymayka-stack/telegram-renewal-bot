@@ -3642,6 +3642,116 @@ async def sweep_blacklisted_user_from_all_channels(
     return removed_from
 
 
+# Blacklisting/banning a user (either direction — /blacklist here, or
+# /onyx/ban arriving from Onyx) previously only kicked them from channels
+# they were *currently* in, leaving any unused invite link they were issued
+# (manual_invite_links, user_channel_access) live and usable to walk right
+# back in. This revokes every such link across both tables, regardless of
+# whether it was ever used.
+async def revoke_all_invite_links_for_user(
+    bot: Bot, supabase: Client, telegram_id: int
+) -> list[str]:
+    revoked_labels: list[str] = []
+
+    try:
+        manual_rows = (
+            supabase.table("manual_invite_links")
+            .select("id, channel_code, telegram_chat_id, invite_link")
+            .eq("used_by_telegram_id", telegram_id)
+            .eq("revoked", False)
+            .execute()
+        )
+    except Exception:
+        logger.warning("Could not list manual_invite_links for telegram_id=%s", telegram_id, exc_info=True)
+        manual_rows = None
+
+    for row in (manual_rows.data if manual_rows else []) or []:
+        link = row.get("invite_link")
+        chat_id_raw = row.get("telegram_chat_id")
+        if not link or not chat_id_raw:
+            continue
+        try:
+            await bot.revoke_chat_invite_link(parse_stored_chat_id(chat_id_raw), link)
+        except Exception:
+            logger.warning("Could not revoke manual_invite_links id=%s", row.get("id"), exc_info=True)
+            continue
+        try:
+            (
+                supabase.table("manual_invite_links")
+                .update({"revoked": True, "revoked_at": now_utc_iso()})
+                .eq("id", row["id"])
+                .execute()
+            )
+        except Exception:
+            logger.warning("Could not mark manual_invite_links id=%s revoked", row.get("id"), exc_info=True)
+        revoked_labels.append(row.get("channel_code") or "manual")
+
+    try:
+        access_rows = (
+            supabase.table("user_channel_access")
+            .select("id, channel_key, chat_id, invite_link")
+            .eq("telegram_id", telegram_id)
+            .eq("invite_link_revoked", False)
+            .execute()
+        )
+    except Exception:
+        logger.warning("Could not list user_channel_access for telegram_id=%s", telegram_id, exc_info=True)
+        access_rows = None
+
+    for row in (access_rows.data if access_rows else []) or []:
+        link = row.get("invite_link")
+        chat_id_raw = row.get("chat_id")
+        if not link or not chat_id_raw:
+            continue
+        try:
+            await bot.revoke_chat_invite_link(parse_stored_chat_id(chat_id_raw), link)
+        except Exception:
+            logger.warning("Could not revoke user_channel_access id=%s", row.get("id"), exc_info=True)
+            continue
+        try:
+            (
+                supabase.table("user_channel_access")
+                .update({"invite_link_revoked": True, "updated_at": now_utc_iso()})
+                .eq("id", row["id"])
+                .execute()
+            )
+        except Exception:
+            logger.warning("Could not mark user_channel_access id=%s revoked", row.get("id"), exc_info=True)
+        revoked_labels.append(row.get("channel_key") or "unknown")
+
+    return revoked_labels
+
+
+# The other half of closing the /blacklist <-> Onyx loop: tells Onyx to
+# suspend the linked fan account (email `<telegramId>@onyx.com`) so a
+# Telegram-side block also locks them out of the app, not just Telegram.
+# Mirrors the auth pattern of every other bot->Onyx call (x-bot-secret).
+# Never raises — a failed call here must not stop /blacklist from finishing
+# the parts that already succeeded (DB write + channel sweep).
+async def notify_onyx_ban(settings: Settings, telegram_id: int, reason: str) -> bool:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{settings.onyx_api_url}/api/bot/ban-fan",
+                headers={"x-bot-secret": settings.onyx_provision_secret},
+                json={"telegramId": str(telegram_id), "reason": reason},
+            )
+        if response.status_code != 200:
+            logger.warning(
+                "Onyx ban-fan call failed telegram_id=%s status=%s body=%s",
+                telegram_id,
+                response.status_code,
+                response.text,
+            )
+            return False
+        return bool(response.json().get("suspended"))
+    except Exception:
+        logger.warning("Could not notify Onyx to ban telegram_id=%s", telegram_id, exc_info=True)
+        return False
+
+
 def mark_user_inactive(supabase: Client, telegram_id: int, notes: str = "Marked inactive from dashboard") -> None:
     (
         supabase.table("telegram_users")
@@ -5178,6 +5288,20 @@ async def blacklist_user(message: Message, settings: Settings, supabase: Client)
     else:
         await message.answer("No estaba activo en ningún canal.")
 
+    try:
+        revoked_links = await revoke_all_invite_links_for_user(message.bot, supabase, telegram_id)
+    except Exception:
+        logger.exception("Could not revoke invite links for blacklisted telegram_id=%s", telegram_id)
+        revoked_links = []
+    if revoked_links:
+        await message.answer(f"Links de invitación revocados: {', '.join(revoked_links)}")
+
+    onyx_suspended = await notify_onyx_ban(settings, telegram_id, "Bloqueado en Telegram (/blacklist)")
+    if onyx_suspended:
+        await message.answer("Cuenta de Onyx suspendida.")
+    elif settings.onyx_api_url and settings.onyx_provision_secret:
+        await message.answer("No pude confirmar la suspensión en Onyx (puede que no tenga cuenta, o ya estaba suspendida).")
+
 
 @router.message(Command("unblacklist"))
 async def unblacklist_user(message: Message, settings: Settings, supabase: Client) -> None:
@@ -5577,12 +5701,12 @@ async def revoke_all_tracked_invite_links(
         rows = (
             supabase.table("user_channel_access")
             .select("id, invite_link")
-            .eq("channel_code", channel_key)
+            .eq("channel_key", channel_key)
             .eq("invite_link_revoked", False)
             .execute()
         )
     except Exception:
-        logger.warning("Could not list invite links to revoke for channel_code=%s", channel_key, exc_info=True)
+        logger.warning("Could not list invite links to revoke for channel_key=%s", channel_key, exc_info=True)
         return 0
 
     revoked = 0
@@ -7879,12 +8003,29 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
             telegram_id = int(telegram_id_raw)
         except (TypeError, ValueError):
             return Response(status_code=400)
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("blacklist")
+                .upsert({"telegram_id": telegram_id, "reason": reason}, on_conflict="telegram_id")
+                .execute()
+            )
+        except Exception:
+            logger.warning("Could not add Onyx-banned telegram_id=%s to blacklist table", telegram_id, exc_info=True)
         removed_from = await sweep_blacklisted_user_from_all_channels(bot, supabase, settings, telegram_id)
+        try:
+            revoked_links = await revoke_all_invite_links_for_user(bot, supabase, telegram_id)
+        except Exception:
+            logger.warning("Could not revoke invite links for Onyx-banned telegram_id=%s", telegram_id, exc_info=True)
+            revoked_links = []
         logger.info(
-            "Onyx ban propagated telegram_id=%s reason=%s removed_from=%s", telegram_id, reason, removed_from
+            "Onyx ban propagated telegram_id=%s reason=%s removed_from=%s revoked_links=%s",
+            telegram_id,
+            reason,
+            removed_from,
+            revoked_links,
         )
         await notify_admin_of_onyx_ban(bot, supabase, settings, telegram_id, reason)
-        return {"ok": True, "removedFrom": removed_from}
+        return {"ok": True, "removedFrom": removed_from, "revokedLinks": revoked_links}
 
     @app.get("/", response_class=HTMLResponse, response_model=None)
     async def root(request: Request):
