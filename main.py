@@ -3536,6 +3536,28 @@ async def remove_user_from_channel(
 ACTIVE_MEMBER_STATUSES = {"member", "administrator", "creator", "restricted"}
 
 
+# Read-only counterpart to the notify_* Onyx bridge calls — lets the
+# "Canales — Migración a Onyx" dashboard hide channels that already have a
+# connected Onyx collection, so the operator only sees what's actually still
+# pending. Never raises: an unreachable Onyx just means the dashboard falls
+# back to showing every channel, same as before this existed.
+async def get_migrated_onyx_channel_codes(settings: Settings) -> set[str]:
+    if not settings.onyx_api_url or not settings.onyx_provision_secret:
+        return set()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{settings.onyx_api_url}/api/bot/migrated-channels",
+                headers={"x-bot-secret": settings.onyx_provision_secret},
+            )
+        if response.status_code != 200:
+            return set()
+        return set(response.json().get("codes") or [])
+    except Exception:
+        logger.warning("Could not fetch migrated Onyx channel codes", exc_info=True)
+        return set()
+
+
 # Tells the admin in the bot's own chat whenever a fan account gets
 # suspended in Onyx — manual (the "Suspender" button on /admin/users) or
 # automatic (client-side anti-piracy triggers), both end up POSTing here via
@@ -8360,6 +8382,8 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
         channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        migrated_codes = await get_migrated_onyx_channel_codes(settings)
+        channels = [c for c in channels if channel_code(c) not in migrated_codes]
         return templates.TemplateResponse(
             request,
             "channels.html",
