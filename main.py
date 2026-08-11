@@ -2953,6 +2953,16 @@ async def send_featured_cross_sell(bot: Bot, supabase: Client, settings: Setting
         logger.exception("Could not send featured cross-sell telegram_id=%s", telegram_id)
 
 
+def generate_easy_password() -> str:
+    # 8-digit numeric code instead of secrets.token_urlsafe(12) — the old
+    # mixed-case+symbol string (e.g. "xK9f2LqZ8vNpQwRt") was miserable to
+    # type on a phone keyboard and easy to mis-key (l/1, O/0). Digits-only
+    # is much faster to enter and read back over Telegram; still 10**8
+    # combinations, plenty for a fan-content account that also has Telegram
+    # identity behind it.
+    return f"{secrets.randbelow(10**8):08d}"
+
+
 # Onyx bridge (2026-08) — best-effort, never raises. Returns None whenever
 # the bridge isn't configured (ONYX_API_URL/ONYX_PROVISION_SECRET unset) or
 # the request itself fails or Onyx has no collection for this channel_code,
@@ -2964,7 +2974,7 @@ async def notify_onyx_provision(
 ) -> dict[str, Any] | None:
     if not settings.onyx_api_url or not settings.onyx_provision_secret:
         return None
-    password = secrets.token_urlsafe(12)
+    password = generate_easy_password()
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
@@ -3016,7 +3026,8 @@ async def onyx_access_note(settings: Settings, telegram_id: int, code: str) -> s
     if onyx_result.get("isNewAccount"):
         return (
             f"Accede en {settings.onyx_api_url} — usuario: {onyx_result['email']} · "
-            f"contraseña: {onyx_result['password']}"
+            f"contraseña: {onyx_result['password']}\n\n"
+            "¿Se te olvida? Manda /olvide_password aquí mismo y te genero una nueva al instante."
         )
     return (
         f"Se agregó a tu cuenta de Onyx ({settings.onyx_api_url}) — "
@@ -3085,11 +3096,12 @@ async def report_credential_delivery(
         )
 
 
-# Backs /reset_password. A fan's original password is never recoverable —
-# Onyx only ever stores it hashed, same as any auth system — so "olvidé mi
-# contraseña" only has one real fix: generate a new one, set it on the Onyx
-# side, and DM it over. Mirrors notify_onyx_provision's password-generation
-# style (secrets.token_urlsafe(12)) and reuses the same credential-delivery
+# Backs /reset_password (admin) and /olvide_password (self-service, see
+# olvide_password_command below). A fan's original password is never
+# recoverable — Onyx only ever stores it hashed, same as any auth system —
+# so "olvidé mi contraseña" only has one real fix: generate a new one, set
+# it on the Onyx side, and DM it over. Uses generate_easy_password() (same
+# as first-time provisioning) and reuses the same credential-delivery
 # reporting endpoint so this shows up on the admin's Onyx user page exactly
 # like any other credentials DM.
 async def reset_onyx_password(
@@ -3098,7 +3110,7 @@ async def reset_onyx_password(
     if not settings.onyx_api_url or not settings.onyx_provision_secret:
         return False, "El puente con Onyx no está configurado (ONYX_API_URL/ONYX_PROVISION_SECRET)."
 
-    new_password = secrets.token_urlsafe(12)
+    new_password = generate_easy_password()
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
@@ -6345,6 +6357,37 @@ async def reset_password_command(message: Message, settings: Settings) -> None:
 
     ok, text = await reset_onyx_password(message.bot, settings, telegram_id)
     await message.answer(("✅ " if ok else "⚠️ ") + text)
+
+
+OLVIDE_PASSWORD_COOLDOWN_SECONDS = 120
+
+
+@router.message(Command("olvide_password"))
+async def olvide_password_command(message: Message, settings: Settings, supabase: Client) -> None:
+    # Self-service counterpart to /reset_password — a fan can only ever
+    # trigger this for their own account (message.from_user.id, verified by
+    # Telegram itself, same trust boundary as every other fan-facing
+    # command), so no admin gate needed. Cooldown per telegram_id via
+    # bot_state guards against someone hammering this and burning through
+    # Onyx's own 20/min bot-wide rate limit on /api/bot/reset-fan-password,
+    # which would also block real admin resets for other fans.
+    telegram_id = message.from_user.id
+    cooldown_key = f"olvide_password_last_{telegram_id}"
+    last_attempt = await asyncio.to_thread(get_bot_state, supabase, cooldown_key)
+    if last_attempt:
+        elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_attempt)).total_seconds()
+        if elapsed < OLVIDE_PASSWORD_COOLDOWN_SECONDS:
+            wait_seconds = int(OLVIDE_PASSWORD_COOLDOWN_SECONDS - elapsed)
+            await message.answer(f"Espera {wait_seconds} segundos antes de pedir otra contraseña nueva.")
+            return
+    await asyncio.to_thread(set_bot_state, supabase, cooldown_key, now_utc_iso())
+
+    ok, _text = await reset_onyx_password(message.bot, settings, telegram_id)
+    if not ok:
+        await message.answer(
+            "No pude resetear tu contraseña — puede que todavía no tengas una cuenta de Onyx. "
+            "Contacta a @chivismontalvoo si el problema sigue."
+        )
 
 
 @router.message(Command("ask_channel"))
