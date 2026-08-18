@@ -5026,8 +5026,8 @@ async def feature_set_command(message: Message, settings: Settings, supabase: Cl
 async def forwarded_photo_alert(message: Message, settings: Settings, supabase: Client) -> None:
     # Desactivado: no se está usando la entrega por DM con marca de agua por ahora, así que esto
     # no debe interceptar fotos reenviadas legítimas (ej. comprobantes de pago). Para reactivar,
-    # quita este return.
-    return
+    # reemplaza este SkipHandler por el código de abajo.
+    raise SkipHandler()
     if not message.from_user:
         return
     user = message.from_user
