@@ -375,6 +375,7 @@ alter table public.raffle_events add column if not exists third_place_ticket tex
 alter table public.raffle_events add column if not exists third_place_telegram_id bigint;
 alter table public.raffle_events add column if not exists fourth_place_ticket text;
 alter table public.raffle_events add column if not exists fourth_place_telegram_id bigint;
+alter table public.raffle_events add column if not exists numbers_per_ticket integer default 1;
 create table if not exists public.cart_reminders (
   telegram_id bigint primary key,
   reminded_at timestamptz default now()
@@ -1643,6 +1644,7 @@ def generate_unique_raffle_numbers(supabase: Client, raffle_id: int, quantity: i
 def reserve_raffle_tickets(supabase: Client, raffle: dict[str, Any], user: Any, quantity: int) -> list[dict[str, Any]]:
     raffle_id = int(raffle["id"])
     max_tickets = int(raffle.get("max_tickets_per_user") or 5)
+    numbers_per_ticket = int(raffle.get("numbers_per_ticket") or 1)
     existing = (
         supabase.table("raffle_tickets")
         .select("id")
@@ -1652,9 +1654,11 @@ def reserve_raffle_tickets(supabase: Client, raffle: dict[str, Any], user: Any, 
         .execute()
     )
     current_count = len(existing.data or [])
-    if current_count + quantity > max_tickets:
-        raise ValueError(f"Puedes reservar máximo {max_tickets} boletos para este sorteo.")
+    total_numbers = quantity * numbers_per_ticket
+    if current_count + total_numbers > max_tickets:
+        raise ValueError(f"Puedes reservar máximo {max_tickets // numbers_per_ticket} boletos para este sorteo.")
     ticket_price = int(raffle.get("ticket_price_mxn") or 100)
+    amount_per_number = ticket_price // numbers_per_ticket
     order_id = str(uuid.uuid4())
     rows = [
         {
@@ -1665,11 +1669,11 @@ def reserve_raffle_tickets(supabase: Client, raffle: dict[str, Any], user: Any, 
             "first_name": user.first_name,
             "ticket_number": number,
             "payment_status": "reserved",
-            "amount_expected_mxn": ticket_price,
+            "amount_expected_mxn": amount_per_number,
             "reserved_at": now_utc_iso(),
             "updated_at": now_utc_iso(),
         }
-        for number in generate_unique_raffle_numbers(supabase, raffle_id, quantity)
+        for number in generate_unique_raffle_numbers(supabase, raffle_id, total_numbers)
     ]
     response = supabase.table("raffle_tickets").insert(rows).execute()
     return response.data or rows
