@@ -43,6 +43,9 @@ CONFIRM_SUBSCRIPTION_MESSAGE = (
 )
 CONFIRM_SUBSCRIPTION_BUTTON_TEXT = "CONFIRMAR SUSCRIPCIÓN ✅"
 CONFIRM_SUBSCRIPTION_CALLBACK_DATA = "confirm_subscription_v1"
+FREE_CHANNEL_VOTE_BUTTON_TEXT = "Sí 🙋‍♀️"
+FREE_CHANNEL_VOTE_CALLBACK_PREFIX = "free_vote"
+FREE_CHANNEL_VOTE_REPLY_TEXT = "Gracias por opinar, espera noticias 💕"
 CONFIRMATION_CAMPAIGN = "subscription_confirmation_v1"
 CONFIRMATION_SOURCE = "confirm_subscription_button"
 INVITE_LINK_LIFETIME = timedelta(hours=24)
@@ -4209,6 +4212,41 @@ def upsert_cta_user(supabase: Client, callback_query: CallbackQuery) -> None:
     logger.info("Registered CTA user telegram_id=%s", user.id)
 
 
+def build_free_channel_vote_keyboard(source_channel: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=FREE_CHANNEL_VOTE_BUTTON_TEXT,
+                    callback_data=f"{FREE_CHANNEL_VOTE_CALLBACK_PREFIX}:{source_channel}",
+                )
+            ]
+        ]
+    )
+
+
+def upsert_free_channel_lead(
+    supabase: Client,
+    telegram_id: int,
+    username: str | None,
+    first_name: str | None,
+    source_channel: str,
+) -> None:
+    (
+        supabase.table("free_channel_leads")
+        .upsert(
+            {
+                "telegram_id": telegram_id,
+                "username": username,
+                "first_name": first_name,
+                "source_channel": source_channel,
+            },
+            on_conflict="telegram_id,source_channel",
+        )
+        .execute()
+    )
+
+
 def upsert_confirmed_subscription_user(supabase: Client, callback_query: CallbackQuery) -> None:
     if not callback_query.from_user:
         raise ValueError("Callback query has no from_user")
@@ -7045,6 +7083,26 @@ async def confirm_subscription(callback_query: CallbackQuery, settings: Settings
         user_id = callback_query.from_user.id if callback_query.from_user else "unknown"
         logger.exception("Could not process subscription confirmation for user_id=%s", user_id)
         await callback_query.answer("Intenta de nuevo.", show_alert=False)
+
+
+@router.callback_query(F.data.startswith(f"{FREE_CHANNEL_VOTE_CALLBACK_PREFIX}:"))
+async def free_channel_vote(callback_query: CallbackQuery, settings: Settings, supabase: Client) -> None:
+    if not callback_query.from_user:
+        await callback_query.answer("Solicitud inválida.", show_alert=True)
+        return
+    if await asyncio.to_thread(should_ignore_blacklisted, supabase, settings, callback_query.from_user.id):
+        return
+    source_channel = (callback_query.data or "").split(":", maxsplit=1)[1]
+    user = callback_query.from_user
+    try:
+        await asyncio.to_thread(
+            upsert_free_channel_lead, supabase, user.id, user.username, user.first_name, source_channel
+        )
+    except Exception:
+        logger.exception(
+            "Could not save free channel lead telegram_id=%s source_channel=%s", user.id, source_channel
+        )
+    await callback_query.answer(FREE_CHANNEL_VOTE_REPLY_TEXT, show_alert=True)
 
 
 @router.callback_query(F.data.startswith("ask_channel:"))
