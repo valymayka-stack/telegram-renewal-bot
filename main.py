@@ -3230,6 +3230,28 @@ async def notify_onyx_expired_channel_access(supabase: Client, settings: Setting
             telegram_id = row.get("telegram_id")
             if telegram_id is None:
                 continue
+            # user_channel_access.expiry_date is only ever refreshed by
+            # approve_payment's per-channel writes — any renewal path that
+            # bypasses that (a one-off admin script, a manual DB edit) and
+            # only updates telegram_users leaves this table stale, and this
+            # sweep would then wrongly tell Onyx to expire someone who
+            # actually renewed (confirmed: happened for real, telegram_id
+            # 1275204401, 2026-08-24 — renewed to 2026-09-19 via a script,
+            # this table stayed at the old 2026-08-20 expiry, Onyx access got
+            # cut same-day). For grupo, telegram_users.expiry_date/status is
+            # the real source of truth used everywhere else in this bot —
+            # cross-check it before trusting this table's possibly-stale row.
+            if code == GRUPO_CHANNEL_KEY:
+                user = await asyncio.to_thread(get_registered_user, supabase, int(telegram_id))
+                if user and user.get("status") == "active":
+                    user_expiry = parse_iso_date(user.get("expiry_date"))
+                    if user_expiry and user_expiry >= datetime.now(APP_TIMEZONE).date():
+                        logger.info(
+                            "Skipping stale user_channel_access expiry for telegram_id=%s "
+                            "channel=grupo — telegram_users still active until %s",
+                            telegram_id, user_expiry,
+                        )
+                        continue
             if await notify_onyx_expiry(settings, int(telegram_id), code):
                 notified += 1
     return notified
@@ -3325,8 +3347,22 @@ async def approve_payment(
             # send_manual_link's onyx branch) — without this, an
             # Onyx-delivered purchase would be invisible to a future sweep,
             # indistinguishable from someone who was never tracked at all.
+            # Passing None here for a has_expiry channel (confirmed bug,
+            # 2026-08-24: this is exactly the path a Grupo renewal takes once
+            # reused_invite is false, i.e. every renewal after the first
+            # month) left this row's expiry_date stale, which
+            # notify_onyx_expired_channel_access later read as "expired" and
+            # wrongly told Onyx to cut a fan's access the same day they
+            # correctly renewed. Must match the two sibling branches above/
+            # below, which already compute this correctly.
             await asyncio.to_thread(
-                save_user_channel_access, supabase, telegram_id, channel, "", "onyx-purchase", None
+                save_user_channel_access,
+                supabase,
+                telegram_id,
+                channel,
+                "",
+                "onyx-purchase",
+                expiry.isoformat() if channel_has_expiry(channel) else None,
             )
             continue
         telegram_chat_id = channel_telegram_chat_id(channel)
