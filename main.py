@@ -2887,6 +2887,7 @@ async def send_channel_invites_to_user(bot: Bot, telegram_id: int, channel_links
 async def confirm_renewal_payment(
     bot: Bot,
     supabase: Client,
+    settings: Settings,
     telegram_id: int,
     admin_id: int,
 ) -> dict[str, Any]:
@@ -2906,6 +2907,33 @@ async def confirm_renewal_payment(
             "pending_payment_file_type": None,
         },
     )
+    # This path (confirm-renewal — no new invite link, fan already has
+    # access) never touched user_channel_access for grupo — the actual
+    # root cause behind two real fans getting their Onyx access wrongly cut
+    # the same day they renewed (2026-08-24/25): the daily
+    # notify_onyx_expired_channel_access sweep reads *this* table, not
+    # telegram_users, to decide who's expired. Skipping it here left it
+    # stuck at the fan's previous expiry, so the very next sweep run treated
+    # them as overdue. Grupo's Onyx grant needs no re-provisioning from this
+    # path — it's already permanent (expires_at null) until the sweep says
+    # otherwise — this is only about keeping the sweep's source data correct.
+    try:
+        channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        grupo_channel = next((c for c in channels if channel_code(c) == GRUPO_CHANNEL_KEY), None)
+        if grupo_channel:
+            await asyncio.to_thread(
+                save_user_channel_access,
+                supabase,
+                telegram_id,
+                grupo_channel,
+                (existing_user or {}).get("invite_link") or "",
+                (existing_user or {}).get("invite_link_name") or f"existing-{telegram_id}",
+                expiry,
+            )
+    except Exception:
+        logger.warning(
+            "Could not refresh user_channel_access after confirm_renewal telegram_id=%s", telegram_id, exc_info=True
+        )
     await asyncio.to_thread(
         insert_payment_history,
         supabase,
@@ -5530,7 +5558,7 @@ async def confirm_renewal(message: Message, settings: Settings, supabase: Client
     if telegram_id is None:
         await message.answer("Uso: /confirm_renewal <telegram_id>")
         return
-    result = await confirm_renewal_payment(message.bot, supabase, telegram_id, message.from_user.id)
+    result = await confirm_renewal_payment(message.bot, supabase, settings, telegram_id, message.from_user.id)
     if result["sent"]:
         await message.answer(f"Renovación confirmada para {telegram_id}. Nuevo vencimiento: {result['expiry']}.")
     else:
@@ -7602,6 +7630,7 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
             result = await confirm_renewal_payment(
                 callback_query.bot,
                 supabase,
+                settings,
                 telegram_id,
                 callback_query.from_user.id,
             )
@@ -8543,7 +8572,7 @@ def create_web_app(settings: Settings, supabase: Client, bot: Bot) -> FastAPI:
     ):
         if not is_logged_in(request):
             return RedirectResponse(url="/login", status_code=303)
-        result = await confirm_renewal_payment(bot, supabase, telegram_id, next(iter(settings.admin_user_ids)))
+        result = await confirm_renewal_payment(bot, supabase, settings, telegram_id, next(iter(settings.admin_user_ids)))
         if result["sent"]:
             return dashboard_redirect(
                 filter,
