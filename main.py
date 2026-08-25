@@ -381,6 +381,13 @@ create table if not exists public.cart_reminders (
   reminded_at timestamptz default now()
 );
 alter table public.access_channels add column if not exists watermark_delivery boolean default false;
+-- Separate from is_active: a channel can be active/onyx-deliverable (shows
+-- in the admin approval grid) without ever being a fan-facing purchase
+-- option (ej. "Quick" — delivered manually via /send_manual_link, never
+-- sold through the bot's own catalog). Defaults true so every existing
+-- channel's catalog behavior is unaffected. Same column name as Lore's bot
+-- for this identical concept.
+alter table public.access_channels add column if not exists visible_en_catalogo boolean default true;
 create table if not exists public.master_content (
   id bigserial primary key,
   channel_code text not null,
@@ -889,6 +896,10 @@ def channel_category(channel: dict[str, Any]) -> str | None:
     return None
 
 
+def channel_visible_in_catalog(channel: dict[str, Any]) -> bool:
+    return channel.get("visible_en_catalogo") is not False
+
+
 def channel_photo_file_id(channel: dict[str, Any]) -> str | None:
     return channel.get("photo_file_id") or None
 
@@ -1108,7 +1119,11 @@ def cart_discount(channels: list[dict[str, Any]]) -> tuple[float, float, float]:
 
 
 def channels_in_category(channels: list[dict[str, Any]], category: str) -> list[dict[str, Any]]:
-    matching = [channel for channel in channels if channel_category(channel) == category]
+    matching = [
+        channel
+        for channel in channels
+        if channel_category(channel) == category and channel_visible_in_catalog(channel)
+    ]
     matching.sort(key=lambda channel: (not channel_is_featured(channel), -(channel_price(channel) or 0)))
     return matching
 
@@ -6479,7 +6494,10 @@ async def ask_channel(message: Message, settings: Settings, supabase: Client) ->
         return
 
     try:
-        channels = await asyncio.to_thread(get_access_channels, supabase, settings)
+        channels = [
+            c for c in await asyncio.to_thread(get_access_channels, supabase, settings)
+            if channel_visible_in_catalog(c)
+        ]
         if not channels:
             await message.answer("No hay canales activos configurados.")
             return
