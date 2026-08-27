@@ -3486,6 +3486,44 @@ async def approve_payment(
             invite_link = generated_link
             invite_name = generated_name
 
+    # "new" channel (2026-08) — delivered automatically alongside every
+    # Grupo approval, same delivery rules as any other channel (Onyx first,
+    # invite-link fallback). Rides along in the same channel_links list, so
+    # it reaches the fan in the same DM as everything else with no change
+    # needed to send_channel_invites_to_user. Best-effort: a failure here
+    # must never block the rest of the approval.
+    if includes_grupo:
+        try:
+            new_fan_channel = next((c for c in available_channels if channel_code(c) == "new"), None)
+            if new_fan_channel:
+                access_note = await onyx_access_note(settings, telegram_id, "new")
+                if access_note is not None:
+                    channel_links.append({"label": channel_label(new_fan_channel), "invite_link": access_note})
+                    onyx_channel_codes.append("new")
+                    await asyncio.to_thread(
+                        save_user_channel_access, supabase, telegram_id, new_fan_channel, "", "onyx-new-bonus", None,
+                    )
+                else:
+                    new_chat_id = channel_telegram_chat_id(new_fan_channel)
+                    if new_chat_id:
+                        parsed_new_chat_id = parse_stored_chat_id(new_chat_id)
+                        try:
+                            await bot.unban_chat_member(chat_id=parsed_new_chat_id, user_id=telegram_id, only_if_banned=True)
+                        except Exception:
+                            logger.warning(
+                                "Could not unban before generating 'new' invite telegram_id=%s chat_id=%s",
+                                telegram_id, parsed_new_chat_id, exc_info=True,
+                            )
+                        new_link, new_name = await create_one_use_invite_link_for_chat(
+                            bot, parsed_new_chat_id, telegram_id, "new"
+                        )
+                        channel_links.append({"label": channel_label(new_fan_channel), "invite_link": new_link})
+                        await asyncio.to_thread(
+                            save_user_channel_access, supabase, telegram_id, new_fan_channel, new_link, new_name, None,
+                        )
+        except Exception:
+            logger.warning("Could not deliver 'new' channel telegram_id=%s", telegram_id, exc_info=True)
+
     approval_payload = {
         "telegram_id": telegram_id,
         "status": "active",
