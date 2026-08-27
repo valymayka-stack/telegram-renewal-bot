@@ -2934,6 +2934,60 @@ async def confirm_renewal_payment(
         logger.warning(
             "Could not refresh user_channel_access after confirm_renewal telegram_id=%s", telegram_id, exc_info=True
         )
+
+    # "renew" channel (2026-08) — delivered automatically alongside every
+    # renewal confirmation, same delivery rules as any other channel: try
+    # Onyx first (onyx_access_note fails closed/returns None if Onyx isn't
+    # configured or doesn't recognize the code), otherwise a fresh one-use
+    # Telegram invite link. Best-effort, wrapped separately from the grupo
+    # refresh above — a failure here must never block the renewal
+    # confirmation itself, which is the one thing this whole function exists
+    # to guarantee.
+    renew_delivery_note: str | None = None
+    try:
+        renew_channel = next((c for c in channels if channel_code(c) == "renew"), None)
+        if renew_channel:
+            access_note = await onyx_access_note(settings, telegram_id, "renew")
+            if access_note is not None:
+                renew_delivery_note = access_note
+                await asyncio.to_thread(
+                    save_user_channel_access,
+                    supabase,
+                    telegram_id,
+                    renew_channel,
+                    "",
+                    "onyx-renew-bonus",
+                    None,
+                )
+            else:
+                telegram_chat_id = channel_telegram_chat_id(renew_channel)
+                if telegram_chat_id:
+                    chat_id = parse_stored_chat_id(telegram_chat_id)
+                    try:
+                        await bot.unban_chat_member(chat_id=chat_id, user_id=telegram_id, only_if_banned=True)
+                    except Exception:
+                        logger.warning(
+                            "Could not unban before generating renew invite telegram_id=%s chat_id=%s",
+                            telegram_id, chat_id, exc_info=True,
+                        )
+                    generated_link, generated_name = await create_one_use_invite_link_for_chat(
+                        bot, chat_id, telegram_id, "renew"
+                    )
+                    renew_delivery_note = generated_link
+                    await asyncio.to_thread(
+                        save_user_channel_access,
+                        supabase,
+                        telegram_id,
+                        renew_channel,
+                        generated_link,
+                        generated_name,
+                        None,
+                    )
+    except Exception:
+        logger.warning(
+            "Could not deliver 'renew' channel after confirm_renewal telegram_id=%s", telegram_id, exc_info=True
+        )
+
     await asyncio.to_thread(
         insert_payment_history,
         supabase,
@@ -2953,11 +3007,11 @@ async def confirm_renewal_payment(
     )
     await asyncio.to_thread(remove_cart_item, supabase, telegram_id, GRUPO_CHANNEL_KEY)
     expiry_display = datetime.fromisoformat(expiry).strftime("%d/%m/%Y")
+    renewal_message = f"Tu membresía ha sido renovada exitosamente 💕\n\nTu nueva fecha de vencimiento es: {expiry_display}"
+    if renew_delivery_note:
+        renewal_message += f"\n\n🎁 {renew_delivery_note}"
     try:
-        await bot.send_message(
-            telegram_id,
-            f"Tu membresía ha sido renovada exitosamente 💕\n\nTu nueva fecha de vencimiento es: {expiry_display}",
-        )
+        await bot.send_message(telegram_id, renewal_message)
         sent = True
     except (TelegramBadRequest, TelegramForbiddenError):
         logger.warning("Could not DM renewal confirmation telegram_id=%s", telegram_id, exc_info=True)
