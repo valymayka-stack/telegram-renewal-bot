@@ -2331,14 +2331,12 @@ def run_schema_migration(supabase: Client) -> None:
     supabase.rpc("exec_sql", {"sql": SCHEMA_MIGRATION_SQL}).execute()
 
 
-def list_dashboard_users(
-    supabase: Client,
-    user_filter: str,
-    search: str = "",
-    page: int = 1,
-    per_page: int = 25,
-) -> dict[str, Any]:
-    query = supabase.table("telegram_users").select("*")
+def _dashboard_base_query(supabase: Client, user_filter: str, count: str | None = None):
+    query = (
+        supabase.table("telegram_users").select("*", count=count)
+        if count
+        else supabase.table("telegram_users").select("*")
+    )
     if user_filter == "active":
         query = query.eq("status", "active")
     elif user_filter == "pending_payments":
@@ -2363,49 +2361,114 @@ def list_dashboard_users(
         query = query.lt("expiry_date", today_iso())
     elif user_filter == "no_expiry":
         query = query.is_("expiry_date", "null")
+    return query
 
-    response = query.order("registered_at", desc=True).limit(2000).execute()
-    rows = response.data or []
-    if user_filter == "not_confirmed":
-        rows = [row for row in rows if row.get("confirmed_subscription") is not True]
-    elif user_filter == "has_payment_history":
-        try:
-            ids_with_history = payment_history_telegram_ids(supabase)
-            rows = [row for row in rows if int(row.get("telegram_id")) in ids_with_history]
-        except Exception:
-            logger.warning("Could not apply has_payment_history dashboard filter", exc_info=True)
-            rows = []
-    search_term = search.strip().lower()
-    if search_term:
-        rows = [
-            row
-            for row in rows
-            if search_term in str(row.get("telegram_id") or "").lower()
-            or search_term in str(row.get("username") or "").lower()
-            or search_term in str(row.get("first_name") or "").lower()
-            or search_term in str(row.get("last_name") or "").lower()
-        ]
 
-    for row in rows:
+def list_dashboard_users(
+    supabase: Client,
+    user_filter: str,
+    search: str = "",
+    page: int = 1,
+    per_page: int = 25,
+) -> dict[str, Any]:
+    search_term = search.strip()
+
+    # not_confirmed/has_payment_history need row-by-row Python logic that
+    # can't be expressed as a single SQL predicate, so they still have to
+    # pull every matching row into memory — but via *real* pagination
+    # (looping .range() calls) rather than one .order().limit(2000).execute()
+    # call. That single call silently came back with at most 1000 rows no
+    # matter what limit() asked for — PostgREST's own default per-request row
+    # ceiling — so any fan registered earlier than the ~1000 most recent
+    # signups was invisible to *every* filter and search on this dashboard
+    # (found 2026-08-30: two real active/paid fans, both far outside that
+    # window, couldn't be found by telegram_id at all).
+    if user_filter in ("not_confirmed", "has_payment_history"):
+        rows: list[dict[str, Any]] = []
+        batch_size = 1000
+        offset = 0
+        while True:
+            resp = (
+                _dashboard_base_query(supabase, user_filter)
+                .order("registered_at", desc=True)
+                .range(offset, offset + batch_size - 1)
+                .execute()
+            )
+            batch = resp.data or []
+            rows.extend(batch)
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+
+        if user_filter == "not_confirmed":
+            rows = [row for row in rows if row.get("confirmed_subscription") is not True]
+        else:
+            try:
+                ids_with_history = payment_history_telegram_ids(supabase)
+                rows = [row for row in rows if int(row.get("telegram_id")) in ids_with_history]
+            except Exception:
+                logger.warning("Could not apply has_payment_history dashboard filter", exc_info=True)
+                rows = []
+
+        if search_term:
+            term_lower = search_term.lower()
+            rows = [
+                row
+                for row in rows
+                if term_lower in str(row.get("telegram_id") or "").lower()
+                or term_lower in str(row.get("username") or "").lower()
+                or term_lower in str(row.get("first_name") or "").lower()
+                or term_lower in str(row.get("last_name") or "").lower()
+            ]
+
+        total = len(rows)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        safe_page = min(max(page, 1), total_pages)
+        start = (safe_page - 1) * per_page
+        page_rows = rows[start : start + per_page]
+    else:
+        # Every other filter (including plain "all" plus a search term) is
+        # pushed straight into the database — a real WHERE clause via .or_()
+        # and .range()-based pagination — instead of fetching a capped window
+        # and grep-ing it in Python. This is the actual fix: results can never
+        # again be limited by how many rows happen to fit in one request.
+        query = _dashboard_base_query(supabase, user_filter, count="exact")
+        if search_term:
+            escaped = search_term.replace(",", " ").replace("(", " ").replace(")", " ").replace("%", "")
+            or_parts = [
+                f"username.ilike.%{escaped}%",
+                f"first_name.ilike.%{escaped}%",
+                f"last_name.ilike.%{escaped}%",
+            ]
+            if escaped.lstrip("-").isdigit():
+                or_parts.append(f"telegram_id.eq.{escaped}")
+            query = query.or_(",".join(or_parts))
+
+        safe_page = max(page, 1)
+        start = (safe_page - 1) * per_page
+        resp = query.order("registered_at", desc=True).range(start, start + per_page - 1).execute()
+        page_rows = resp.data or []
+        total = resp.count or 0
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        if safe_page > total_pages:
+            safe_page = total_pages
+            start = (safe_page - 1) * per_page
+            resp = query.order("registered_at", desc=True).range(start, start + per_page - 1).execute()
+            page_rows = resp.data or []
+
+    for row in page_rows:
         row["days_remaining"] = days_remaining(row.get("expiry_date"))
         row["joined_at_display"] = format_local_datetime(row.get("joined_at"))
         row["confirmed_at_display"] = format_local_datetime(row.get("confirmed_at"))
         row["joined_channel_at_display"] = format_local_datetime(row.get("joined_channel_at"))
         row["left_channel_at_display"] = format_local_datetime(row.get("left_channel_at"))
         row["membership_start_date_effective"] = membership_start_for_user(row).isoformat()
-
-    total = len(rows)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-    safe_page = min(max(page, 1), total_pages)
-    start = (safe_page - 1) * per_page
-    end = start + per_page
-    page_rows = rows[start:end]
-    for row in page_rows:
         try:
             row["recent_payment_history"] = get_payment_history(supabase, int(row["telegram_id"]), limit=5)
         except Exception:
             logger.warning("Could not load recent payment history telegram_id=%s", row.get("telegram_id"), exc_info=True)
             row["recent_payment_history"] = []
+
     return {
         "rows": page_rows,
         "total": total,
