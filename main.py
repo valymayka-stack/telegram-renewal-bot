@@ -1449,6 +1449,27 @@ def is_blacklisted(supabase: Client, telegram_id: int) -> bool:
         return False
 
 
+def get_blacklisted_telegram_ids(supabase: Client, telegram_ids: list[int]) -> set[int]:
+    """Bulk version of is_blacklisted, for filtering a batch of fans before a
+    scheduled/proactive send (cart reminders, renewal notices) instead of
+    querying once per id. BlacklistMiddleware already silences the reactive
+    side (fan -> bot); this is what closes the other direction (bot -> fan)
+    for scheduled jobs that don't go through that middleware."""
+    if not telegram_ids:
+        return set()
+    try:
+        response = (
+            supabase.table("blacklist")
+            .select("telegram_id")
+            .in_("telegram_id", telegram_ids)
+            .execute()
+        )
+        return {row["telegram_id"] for row in (response.data or [])}
+    except Exception:
+        logger.warning("Could not bulk-check blacklist for %d ids", len(telegram_ids), exc_info=True)
+        return set()
+
+
 def should_ignore_blacklisted(supabase: Client, settings: Settings, telegram_id: int) -> bool:
     if telegram_id in settings.admin_user_ids:
         return False
@@ -8218,7 +8239,10 @@ async def send_cart_abandonment_reminders(bot: Bot, supabase: Client, settings: 
             return
         already = await asyncio.to_thread(already_reminded_telegram_ids, supabase, stale_ids)
         pending = await asyncio.to_thread(pending_review_telegram_ids, supabase, stale_ids)
-        candidates = [tid for tid in stale_ids if tid not in already and tid not in pending]
+        blacklisted = await asyncio.to_thread(get_blacklisted_telegram_ids, supabase, stale_ids)
+        candidates = [
+            tid for tid in stale_ids if tid not in already and tid not in pending and tid not in blacklisted
+        ]
         if not candidates:
             return
         channels = await asyncio.to_thread(get_access_channels, supabase, settings)
@@ -8259,12 +8283,19 @@ async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) 
             if rows:
                 sections.append(f"Expiran en {notice_day} días ({target}): {len(rows)}")
                 sections.extend(format_user(row) for row in rows)
+                blacklisted = await asyncio.to_thread(
+                    get_blacklisted_telegram_ids, supabase, [r["telegram_id"] for r in rows if r.get("telegram_id") is not None]
+                )
                 sent_ids: list[int] = []
                 failed_ids: list[str] = []
                 for row in rows:
                     telegram_id = row.get("telegram_id")
                     if telegram_id is None:
                         failed_ids.append("-")
+                        continue
+                    if int(telegram_id) in blacklisted:
+                        # Ignorado a nivel bot: no se le manda el aviso, pero
+                        # tampoco cuenta como fallido — simplemente se omite.
                         continue
                     try:
                         await bot.send_message(
