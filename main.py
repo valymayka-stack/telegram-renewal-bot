@@ -7084,11 +7084,14 @@ async def renewal_message_confirm(message: Message, settings: Settings, supabase
         await message.answer(f"No pude consultar renovaciones próximas: {exc}")
         return
 
+    blacklisted = await asyncio.to_thread(
+        get_blacklisted_telegram_ids, supabase, [r["telegram_id"] for r in rows if r.get("telegram_id") is not None]
+    )
     sent = 0
     failed_ids: list[str] = []
     for row in rows:
         telegram_id = row.get("telegram_id")
-        if telegram_id is None:
+        if telegram_id is None or int(telegram_id) in blacklisted:
             continue
         try:
             await message.bot.send_message(
