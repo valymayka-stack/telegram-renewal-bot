@@ -46,6 +46,14 @@ CONFIRM_SUBSCRIPTION_CALLBACK_DATA = "confirm_subscription_v1"
 FREE_CHANNEL_VOTE_BUTTON_TEXT = "Sí 🙋‍♀️"
 FREE_CHANNEL_VOTE_CALLBACK_PREFIX = "free_vote"
 FREE_CHANNEL_VOTE_REPLY_TEXT = "Gracias por opinar, espera noticias 💕"
+# Deep-link version of the free-channel vote button: instead of an in-channel
+# callback (never opens a chat with the bot), the button is a t.me/<bot>?start=
+# link — clicking it opens the bot chat and fires /start promo, which is what
+# actually lets the bot message them again later (and gets them "into" the
+# bot, not just a channel-post toast). Same dedup as the callback version
+# (upsert_free_channel_lead, on_conflict telegram_id+source_channel).
+FREE_CHANNEL_START_PAYLOAD = "promo"
+FREE_CHANNEL_START_SOURCE = "chivilovers"
 CONFIRMATION_CAMPAIGN = "subscription_confirmation_v1"
 CONFIRMATION_SOURCE = "confirm_subscription_button"
 INVITE_LINK_LIFETIME = timedelta(hours=24)
@@ -4583,7 +4591,24 @@ async def cart_start(message: Message, settings: Settings, supabase: Client, com
     if not message.from_user:
         return
     if command.args:
-        raffle = await asyncio.to_thread(get_active_raffle_by_trigger, supabase, command.args.strip())
+        args = command.args.strip()
+        if args == FREE_CHANNEL_START_PAYLOAD:
+            try:
+                await asyncio.to_thread(
+                    upsert_free_channel_lead,
+                    supabase,
+                    message.from_user.id,
+                    message.from_user.username,
+                    message.from_user.first_name,
+                    FREE_CHANNEL_START_SOURCE,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not save free channel lead (start deep link) telegram_id=%s", message.from_user.id
+                )
+            await message.answer(FREE_CHANNEL_VOTE_REPLY_TEXT)
+            return
+        raffle = await asyncio.to_thread(get_active_raffle_by_trigger, supabase, args)
         if raffle:
             title = raffle.get("title") or "Sorteo"
             description = raffle.get("description") or ""
