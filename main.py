@@ -5151,7 +5151,7 @@ TELEGRAM_BOT_FILE_SIZE_LIMIT = 20 * 1024 * 1024
 # always posts a single photo/video/text at a time, never a multi-photo
 # album, so there's no media_group_id batching here — every post arrives as
 # its own independent message.
-@router.channel_post(F.photo | F.video | F.text)
+@router.channel_post(F.photo | F.video | F.animation | F.text)
 async def mirror_grupo_post_to_onyx(message: Message, settings: Settings, supabase: Client) -> None:
     # Any slash-command (e.g. /chat_id, /master <code>) has its own
     # dedicated handler elsewhere in the file — this must never intercept
@@ -5202,6 +5202,28 @@ async def mirror_grupo_post_to_onyx(message: Message, settings: Settings, supaba
         file_bytes = buffer.getvalue()
         filename = "video.mp4"
         mime = message.video.mime_type or "video/mp4"
+    elif message.animation:
+        # A GIF posted to Telegram arrives as an Animation, not a Video —
+        # Telegram itself stores it as a soundless MP4 under the hood, so it
+        # mirrors to Onyx exactly like a video (found 2026-08-31: a GIF post
+        # silently never mirrored at all, since this handler didn't even
+        # recognize the content type — not a failed mirror, no mirror
+        # attempted).
+        if (message.animation.file_size or 0) > TELEGRAM_BOT_FILE_SIZE_LIMIT:
+            size_mb = round((message.animation.file_size or 0) / (1024 * 1024), 1)
+            await message.bot.send_message(
+                settings.admin_chat_id,
+                f"⚠️ No pude reflejar en Onyx un GIF de Grupo ({size_mb}MB) — Telegram no deja "
+                "que los bots bajen archivos de más de 20MB. Súbelo a mano en /admin/collections.",
+            )
+            return
+        content_type = "video"
+        telegram_file = await message.bot.get_file(message.animation.file_id)
+        buffer = BytesIO()
+        await message.bot.download_file(telegram_file.file_path, destination=buffer)
+        file_bytes = buffer.getvalue()
+        filename = "animation.mp4"
+        mime = message.animation.mime_type or "video/mp4"
     else:
         content_type = "text"
 
