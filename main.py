@@ -396,6 +396,13 @@ alter table public.access_channels add column if not exists watermark_delivery b
 -- channel's catalog behavior is unaffected. Same column name as Lore's bot
 -- for this identical concept.
 alter table public.access_channels add column if not exists visible_en_catalogo boolean default true;
+-- Precio de promoción con fecha límite (2026-08-31) — mientras promo_ends_at
+-- sea hoy o una fecha futura, channel_price() devuelve promo_price en vez de
+-- price (mismo valor usado para el carrusel, el carrito y el cobro real), y
+-- carousel_caption() muestra el precio original tachado. Después de esa
+-- fecha vuelve a price automáticamente sin que nadie tenga que tocar nada.
+alter table public.access_channels add column if not exists promo_price numeric;
+alter table public.access_channels add column if not exists promo_ends_at date;
 create table if not exists public.master_content (
   id bigserial primary key,
   channel_code text not null,
@@ -887,7 +894,24 @@ def channel_telegram_chat_id(channel: dict[str, Any]) -> Any:
     return channel.get("telegram_chat_id") or channel.get("chat_id")
 
 
-def channel_price(channel: dict[str, Any]) -> float | None:
+_MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+
+
+def fecha_es(d: date) -> str:
+    return f"{d.day} de {_MESES_ES[d.month - 1]}"
+
+
+def strike(text: str) -> str:
+    """Unicode combining-strikethrough — renders in any Telegram client
+    regardless of parse_mode, so it's safe to mix into a caption that's sent
+    without HTML/Markdown parsing (carousel_caption's callers don't set one)."""
+    return "".join(ch + "̶" for ch in text)
+
+
+def channel_original_price(channel: dict[str, Any]) -> float | None:
     price = channel.get("price")
     if price is None:
         return None
@@ -895,6 +919,30 @@ def channel_price(channel: dict[str, Any]) -> float | None:
         return float(price)
     except (TypeError, ValueError):
         return None
+
+
+def active_promo_price(channel: dict[str, Any]) -> float | None:
+    promo_price = channel.get("promo_price")
+    ends_at = channel.get("promo_ends_at")
+    if promo_price is None or not ends_at:
+        return None
+    try:
+        end_date = date.fromisoformat(str(ends_at)[:10])
+    except ValueError:
+        return None
+    if datetime.now(APP_TIMEZONE).date() > end_date:
+        return None
+    try:
+        return float(promo_price)
+    except (TypeError, ValueError):
+        return None
+
+
+def channel_price(channel: dict[str, Any]) -> float | None:
+    promo = active_promo_price(channel)
+    if promo is not None:
+        return promo
+    return channel_original_price(channel)
 
 
 def channel_category(channel: dict[str, Any]) -> str | None:
@@ -4309,8 +4357,21 @@ def build_category_picker_keyboard() -> InlineKeyboardMarkup:
 
 def carousel_caption(channel: dict[str, Any]) -> str:
     label = channel_label(channel)
-    price = channel_price(channel)
-    price_text = f"${price:.0f} MXN" if price is not None else "-"
+    promo_price = active_promo_price(channel)
+    original_price = channel_original_price(channel)
+    if promo_price is not None and original_price is not None:
+        ends_at = channel.get("promo_ends_at")
+        try:
+            fecha_limite = fecha_es(date.fromisoformat(str(ends_at)[:10]))
+        except ValueError:
+            fecha_limite = str(ends_at)
+        price_text = (
+            f"{strike(f'${original_price:.0f} MXN')} 🔥 ${promo_price:.0f} MXN "
+            f"— disponible hasta el {fecha_limite}"
+        )
+    else:
+        price = channel_price(channel)
+        price_text = f"${price:.0f} MXN" if price is not None else "-"
     badges = []
     if channel_is_featured(channel):
         badges.append("⭐ DESTACADO")
@@ -8260,11 +8321,11 @@ async def run_daily_notice_if_needed(bot: Bot, supabase: Client, settings: Setti
     await asyncio.to_thread(set_bot_state, supabase, DAILY_NOTICE_STATE_KEY, today)
 
 
-async def send_cart_abandonment_reminders(bot: Bot, supabase: Client, settings: Settings) -> None:
+async def send_cart_abandonment_reminders(bot: Bot, supabase: Client, settings: Settings) -> int:
     try:
         stale_ids = await asyncio.to_thread(get_stale_cart_telegram_ids, supabase, 24 * 60)
         if not stale_ids:
-            return
+            return 0
         already = await asyncio.to_thread(already_reminded_telegram_ids, supabase, stale_ids)
         pending = await asyncio.to_thread(pending_review_telegram_ids, supabase, stale_ids)
         blacklisted = await asyncio.to_thread(get_blacklisted_telegram_ids, supabase, stale_ids)
@@ -8272,7 +8333,7 @@ async def send_cart_abandonment_reminders(bot: Bot, supabase: Client, settings: 
             tid for tid in stale_ids if tid not in already and tid not in pending and tid not in blacklisted
         ]
         if not candidates:
-            return
+            return 0
         channels = await asyncio.to_thread(get_access_channels, supabase, settings)
         sent = 0
         for telegram_id in candidates:
@@ -8296,8 +8357,10 @@ async def send_cart_abandonment_reminders(bot: Bot, supabase: Client, settings: 
             await asyncio.to_thread(mark_cart_reminded, supabase, telegram_id)
         if sent:
             logger.info("Sent %s cart abandonment reminders", sent)
+        return sent
     except Exception:
         logger.exception("Cart abandonment reminder job failed")
+        return 0
 
 
 async def notify_expiring_today(bot: Bot, supabase: Client, settings: Settings) -> None:
