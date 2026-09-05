@@ -3207,49 +3207,75 @@ def generate_easy_password() -> str:
     return f"{secrets.randbelow(10**8):08d}"
 
 
-# Onyx bridge (2026-08) — best-effort, never raises. Returns None whenever
-# the bridge isn't configured (ONYX_API_URL/ONYX_PROVISION_SECRET unset) or
-# the request itself fails or Onyx has no collection for this channel_code,
-# so every caller can fall back to the pre-Onyx behavior for that channel
-# rather than fail the whole approval. Not called from anywhere yet unless
-# ONYX_PROVISIONING_ENABLED is explicitly turned on — see approve_payment.
+# Onyx bridge (2026-08). Returns None only when the bridge itself isn't
+# configured (ONYX_API_URL/ONYX_PROVISION_SECRET unset) — a deliberate
+# off-switch, not a failure. Every real delivery MUST go through Onyx
+# (operator mandate, 2026-09-05): a data audit found 787 of 1,137 real
+# deliveries since 2026-08-06 (~72%) silently fell back to a Telegram invite
+# link instead, traced to findFanIdByEmail's O(users) scan on Onyx's side
+# routinely exceeding this call's old 10s timeout (fixed separately in Onyx's
+# own repo, 0028_fast_auth_user_by_email.sql). Rather than trust a timeout to
+# never happen again, this now retries with backoff *forever* on any network
+# error or non-200 response instead of giving up and returning None — the
+# caller (approve_payment) has no Telegram-fallback path left to fall into
+# for Onyx-enabled channels, so this must not return a "give up" signal for
+# a transient failure. Runs as a plain awaited coroutine, not blocking the
+# rest of the bot (aiogram's event loop keeps serving other updates while
+# this one sleeps between attempts) — but the specific approval that
+# triggered this will hang until Onyx responds, by design.
 async def notify_onyx_provision(
     settings: Settings, telegram_id: int, channel_code_value: str
 ) -> dict[str, Any] | None:
     if not settings.onyx_api_url or not settings.onyx_provision_secret:
         return None
     password = generate_easy_password()
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{settings.onyx_api_url}/api/bot/provision-fan",
-                json={
-                    "telegramId": str(telegram_id),
-                    "password": password,
-                    "channelCode": channel_code_value,
-                },
-                headers={"x-bot-secret": settings.onyx_provision_secret},
+    attempt = 0
+    delay_seconds = 5.0
+    max_delay_seconds = 60.0
+    while True:
+        attempt += 1
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{settings.onyx_api_url}/api/bot/provision-fan",
+                    json={
+                        "telegramId": str(telegram_id),
+                        "password": password,
+                        "channelCode": channel_code_value,
+                    },
+                    headers={"x-bot-secret": settings.onyx_provision_secret},
+                )
+        except Exception:
+            logger.warning(
+                "Onyx provision-fan request failed (attempt %s) telegram_id=%s channel=%s — retrying in %.0fs",
+                attempt,
+                telegram_id,
+                channel_code_value,
+                delay_seconds,
+                exc_info=True,
             )
-    except Exception:
-        logger.exception(
-            "Onyx provision-fan request failed telegram_id=%s channel=%s", telegram_id, channel_code_value
-        )
-        return None
-    if response.status_code != 200:
-        logger.warning(
-            "Onyx provision-fan rejected telegram_id=%s channel=%s status=%s body=%s",
-            telegram_id,
-            channel_code_value,
-            response.status_code,
-            response.text,
-        )
-        return None
-    data = response.json()
-    if data.get("isNewAccount"):
-        # Onyx never echoes the password back — it's only known here,
-        # since we generated it for this call.
-        data["password"] = password
-    return data
+            await asyncio.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 1.5, max_delay_seconds)
+            continue
+        if response.status_code != 200:
+            logger.warning(
+                "Onyx provision-fan rejected (attempt %s) telegram_id=%s channel=%s status=%s body=%s — retrying in %.0fs",
+                attempt,
+                telegram_id,
+                channel_code_value,
+                response.status_code,
+                response.text,
+                delay_seconds,
+            )
+            await asyncio.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 1.5, max_delay_seconds)
+            continue
+        data = response.json()
+        if data.get("isNewAccount"):
+            # Onyx never echoes the password back — it's only known here,
+            # since we generated it for this call.
+            data["password"] = password
+        return data
 
 
 # Shared by every delivery path that isn't the main approve_payment loop
@@ -7875,11 +7901,22 @@ async def payment_admin_callback(callback_query: CallbackQuery, settings: Settin
                 callback_query.from_user.id,
                 selected,
             )
+            # Onyx retries indefinitely now (notify_onyx_provision, 2026-09-05)
+            # — a slow approval can outlive Telegram's callback-query token,
+            # which makes .answer() throw "query is too old". That's fine to
+            # swallow: the buttons are already gone (edit_reply_markup above)
+            # and the real confirmation is the message edit + DM below.
             if result.get("duplicate"):
-                await callback_query.answer("Ya estaba aprobado; reenvié el link existente.", show_alert=True)
+                try:
+                    await callback_query.answer("Ya estaba aprobado; reenvié el link existente.", show_alert=True)
+                except TelegramBadRequest:
+                    pass
                 summary = "✅ APROBADO (ya existía) — link reenviado"
             else:
-                await callback_query.answer("Aprobado ✅")
+                try:
+                    await callback_query.answer("Aprobado ✅")
+                except TelegramBadRequest:
+                    pass
                 labels = ", ".join(item["label"] for item in result.get("channel_links", []))
                 summary = f"✅ APROBADO — Enviado a: {labels}" if labels else "✅ APROBADO"
             if selection_key:
